@@ -1,0 +1,727 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy FlashBang Honeypot with Enhanced Security, Monitoring, and Multi-Service Support
+
+Parameters:
+  MyIP:
+    Type: String
+    Description: Your IP address to allow SSH access (e.g., 203.0.113.0/32)
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid CIDR notation (e.g., 203.0.113.0/32)
+
+  MyVPC:
+    Type: AWS::EC2::VPC::Id
+    Description: The VPC to launch the instance in
+
+  PublicSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of public subnets for ALB (minimum 2 in different AZs)
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet for honeypot instance (more secure)
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for attack notifications (optional)
+    Default: ""
+
+  SlackWebhookURL:
+    Type: String
+    Description: Slack webhook URL for real-time alerts (optional)
+    Default: ""
+    NoEcho: true
+
+  EnableCloudWatchLogs:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable CloudWatch logging for attack attempts
+
+  EnableS3LogBackup:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable S3 backup for logs and Lambda processing
+
+  EnableThreatIntel:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Enable threat intelligence enrichment
+
+  AbuseIPDBKey:
+    Type: String
+    Description: AbuseIPDB API key for threat intelligence (optional)
+    Default: ""
+    NoEcho: true
+
+  VirusTotalAPIKey:
+    Type: String
+    Description: VirusTotal API key for malware analysis (optional)
+    Default: ""
+    NoEcho: true
+
+  EnableHTTPS:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable HTTPS with ALB and ACM
+
+  DomainName:
+    Type: String
+    Description: Domain name for HTTPS certificate (e.g., honeypot.example.com)
+    Default: ""
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.micro, t3.small, t3.medium, t3.large]
+    Description: EC2 instance type
+
+  EnableContainerServices:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Enable Docker-based honeypot services
+
+  EnableWAF:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Enable AWS WAF for additional protection
+
+  HoneypotMode:
+    Type: String
+    Default: "medium"
+    AllowedValues: ["low", "medium", "high"]
+    Description: Honeypot interaction level (low=logging only, medium=basic interaction, high=full deception)
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - MyVPC
+          - PublicSubnets
+          - PrivateSubnet
+          - MyIP
+      - Label:
+          default: "Instance Configuration"
+        Parameters:
+          - InstanceType
+          - KeyName
+          - HoneypotMode
+          - EnableContainerServices
+      - Label:
+          default: "Security & Monitoring"
+        Parameters:
+          - EnableCloudWatchLogs
+          - EnableS3LogBackup
+          - EnableWAF
+          - NotificationEmail
+          - SlackWebhookURL
+      - Label:
+          default: "Threat Intelligence"
+        Parameters:
+          - EnableThreatIntel
+          - AbuseIPDBKey
+          - VirusTotalAPIKey
+      - Label:
+          default: "HTTPS Configuration"
+        Parameters:
+          - EnableHTTPS
+          - DomainName
+
+Conditions:
+  CreateSNSTopic: !Not [!Equals [!Ref NotificationEmail, ""]]
+  EnableSlack: !Not [!Equals [!Ref SlackWebhookURL, ""]]
+  EnableLogging: !Equals [!Ref EnableCloudWatchLogs, "true"]
+  EnableS3Backup: !Equals [!Ref EnableS3LogBackup, "true"]
+  EnableThreatIntel: !And 
+    - !Equals [!Ref EnableThreatIntel, "true"]
+    - !Not [!Equals [!Ref AbuseIPDBKey, ""]]
+  EnableVirusTotal: !Not [!Equals [!Ref VirusTotalAPIKey, ""]]
+  EnableHTTPS: !And
+    - !Equals [!Ref EnableHTTPS, "true"]
+    - !Not [!Equals [!Ref DomainName, ""]]
+  EnableContainers: !Equals [!Ref EnableContainerServices, "true"]
+  EnableWAF: !Equals [!Ref EnableWAF, "true"]
+  HighInteraction: !Equals [!Ref HoneypotMode, "high"]
+
+Resources:
+  # DynamoDB Table for Attack Analytics
+  AttackAnalyticsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-AttackAnalytics"
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: ip_address
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+        - AttributeName: endpoint
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ip_address
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: endpoint-timestamp-index
+          KeySchema:
+            - AttributeName: endpoint
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Purpose
+          Value: FlashBang-Analytics
+
+  # S3 Bucket for Log Storage and Malware Samples
+  FlashBangLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-flashbang-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpirationInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt LogProcessorLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: logs/
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt MalwareAnalyzerLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: malware-samples/
+
+  # Enhanced Lambda for Log Processing
+  LogProcessorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-log-processor"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 900
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !If [CreateSNSTopic, !Ref FlashBangAlerts, ""]
+          SLACK_WEBHOOK: !If [EnableSlack, !Ref SlackWebhookURL, ""]
+          DYNAMODB_TABLE: !Ref AttackAnalyticsTable
+          ENABLE_THREAT_INTEL: !Ref EnableThreatIntel
+          ABUSEIPDB_KEY: !Ref AbuseIPDBKey
+          HONEYPOT_MODE: !Ref HoneypotMode
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import gzip
+          import base64
+          import os
+          import re
+          from collections import defaultdict, Counter
+          from datetime import datetime, timedelta
+          import requests
+          from urllib.parse import unquote
+
+          # Initialize AWS clients
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
+
+          def lambda_handler(event, context):
+              try:
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = record['s3']['object']['key']
+                      
+                      # Download and process log file
+                      response = s3.get_object(Bucket=bucket, Key=key)
+                      
+                      # Handle gzipped files
+                      if key.endswith('.gz'):
+                          content = gzip.decompress(response['Body'].read()).decode('utf-8')
+                      else:
+                          content = response['Body'].read().decode('utf-8')
+                      
+                      # Parse logs and generate report
+                      report = analyze_logs(content)
+                      
+                      # Store analytics in DynamoDB
+                      store_analytics(report)
+                      
+                      # Send alerts based on severity
+                      if should_alert(report):
+                          send_alerts(report)
+                      
+                  return {'statusCode': 200, 'body': 'Success'}
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {'statusCode': 500, 'body': f'Error: {str(e)}'}
+
+          def analyze_logs(content):
+              lines = content.strip().split('\n')
+              ip_data = defaultdict(lambda: {
+                  'count': 0, 
+                  'endpoints': Counter(), 
+                  'user_agents': set(),
+                  'methods': Counter(),
+                  'payloads': [],
+                  'first_seen': None,
+                  'last_seen': None
+              })
+              
+              # Pattern analysis
+              sql_injection_patterns = [
+                  r"union.*select", r"or.*=.*--", r"';.*drop.*table",
+                  r"exec.*xp_cmdshell", r"information_schema"
+              ]
+              
+              xss_patterns = [
+                  r"<script", r"javascript:", r"onerror=", r"onload=",
+                  r"alert\(", r"document\.cookie"
+              ]
+              
+              command_injection_patterns = [
+                  r";\s*cat\s*/etc/passwd", r"\|\s*nc\s+", r"&&\s*whoami",
+                  r"`.*`", r"\$\(.*\)"
+              ]
+              
+              total_attacks = 0
+              attack_types = Counter()
+              high_risk_ips = set()
+              
+              for line in lines:
+                  if 'Attack attempt' in line or 'GET' in line or 'POST' in line:
+                      total_attacks += 1
+                      
+                      # Extract details
+                      ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
+                      if not ip_match:
+                          continue
+                          
+                      ip = ip_match.group(1)
+                      timestamp = datetime.now()
+                      
+                      # Extract endpoint
+                      endpoint_match = re.search(r'(?:GET|POST|PUT|DELETE)\s+([^\s]+)', line)
+                      endpoint = endpoint_match.group(1) if endpoint_match else '/'
+                      
+                      # Decode URL encoding
+                      try:
+                          endpoint = unquote(endpoint)
+                      except:
+                          pass
+                      
+                      # Update IP data
+                      ip_info = ip_data[ip]
+                      ip_info['count'] += 1
+                      ip_info['endpoints'][endpoint] += 1
+                      
+                      if not ip_info['first_seen']:
+                          ip_info['first_seen'] = timestamp
+                      ip_info['last_seen'] = timestamp
+                      
+                      # Analyze attack patterns
+                      line_lower = line.lower()
+                      
+                      # Check for SQL injection
+                      for pattern in sql_injection_patterns:
+                          if re.search(pattern, line_lower):
+                              attack_types['sql_injection'] += 1
+                              ip_info['payloads'].append({'type': 'sql_injection', 'payload': endpoint})
+                              high_risk_ips.add(ip)
+                              break
+                      
+                      # Check for XSS
+                      for pattern in xss_patterns:
+                          if re.search(pattern, line_lower):
+                              attack_types['xss'] += 1
+                              ip_info['payloads'].append({'type': 'xss', 'payload': endpoint})
+                              high_risk_ips.add(ip)
+                              break
+                      
+                      # Check for command injection
+                      for pattern in command_injection_patterns:
+                          if re.search(pattern, line_lower):
+                              attack_types['command_injection'] += 1
+                              ip_info['payloads'].append({'type': 'command_injection', 'payload': endpoint})
+                              high_risk_ips.add(ip)
+                              break
+                      
+                      # Check for scanning behavior
+                      if ip_info['count'] > 100 and len(ip_info['endpoints']) > 20:
+                          attack_types['scanning'] += 1
+                          high_risk_ips.add(ip)
+              
+              # Get threat intelligence for high-risk IPs
+              enriched_ips = []
+              if os.environ.get('ENABLE_THREAT_INTEL') == 'true':
+                  for ip in list(high_risk_ips)[:10]:  # Limit to top 10
+                      intel = get_comprehensive_threat_intel(ip)
+                      enriched_ips.append({
+                          'ip': ip,
+                          'data': ip_data[ip],
+                          'threat_intel': intel
+                      })
+              
+              return {
+                  'total_attacks': total_attacks,
+                  'unique_ips': len(ip_data),
+                  'attack_types': dict(attack_types),
+                  'high_risk_ips': list(high_risk_ips),
+                  'top_attackers': get_top_attackers(ip_data),
+                  'enriched_ips': enriched_ips,
+                  'timestamp': datetime.now().isoformat(),
+                  'honeypot_mode': os.environ.get('HONEYPOT_MODE', 'medium')
+              }
+
+          def get_comprehensive_threat_intel(ip):
+              """Get threat intelligence from multiple sources"""
+              intel = {
+                  'abuseipdb': None,
+                  'reputation_score': 0,
+                  'known_malicious': False,
+                  'tags': []
+              }
+              
+              # AbuseIPDB lookup
+              api_key = os.environ.get('ABUSEIPDB_KEY')
+              if api_key:
+                  try:
+                      headers = {'Key': api_key, 'Accept': 'application/json'}
+                      params = {'ipAddress': ip, 'maxAgeInDays': 90, 'verbose': ''}
+                      response = requests.get('https://api.abuseipdb.com/api/v2/check',
+                                            headers=headers, params=params, timeout=10)
+                      
+                      if response.status_code == 200:
+                          data = response.json().get('data', {})
+                          intel['abuseipdb'] = {
+                              'abuse_confidence': data.get('abuseConfidencePercentage', 0),
+                              'country': data.get('countryCode', 'Unknown'),
+                              'usage_type': data.get('usageType', 'Unknown'),
+                              'total_reports': data.get('totalReports', 0),
+                              'last_reported': data.get('lastReportedAt', 'Never')
+                          }
+                          
+                          # Calculate reputation score
+                          intel['reputation_score'] = data.get('abuseConfidencePercentage', 0)
+                          
+                          if intel['reputation_score'] > 75:
+                              intel['known_malicious'] = True
+                              intel['tags'].append('high_risk')
+                          
+                          # Add usage type tags
+                          usage = data.get('usageType', '').lower()
+                          if 'vpn' in usage:
+                              intel['tags'].append('vpn')
+                          if 'tor' in usage:
+                              intel['tags'].append('tor')
+                          if 'hosting' in usage:
+                              intel['tags'].append('hosting')
+                  
+                  except Exception as e:
+                      print(f"Threat intel lookup failed for {ip}: {e}")
+              
+              return intel
+
+          def get_top_attackers(ip_data, limit=10):
+              """Get top attacking IPs with details"""
+              sorted_ips = sorted(ip_data.items(), key=lambda x: x[1]['count'], reverse=True)
+              
+              top_attackers = []
+              for ip, data in sorted_ips[:limit]:
+                  attacker_info = {
+                      'ip': ip,
+                      'total_requests': data['count'],
+                      'unique_endpoints': len(data['endpoints']),
+                      'top_endpoints': data['endpoints'].most_common(5),
+                      'attack_duration': calculate_duration(data['first_seen'], data['last_seen']),
+                      'attack_velocity': calculate_velocity(data),
+                      'risk_score': calculate_risk_score(data)
+                  }
+                  top_attackers.append(attacker_info)
+              
+              return top_attackers
+
+          def calculate_duration(first_seen, last_seen):
+              """Calculate attack duration"""
+              if not first_seen or not last_seen:
+                  return "Unknown"
+              
+              delta = last_seen - first_seen
+              hours = delta.total_seconds() / 3600
+              
+              if hours < 1:
+                  return f"{int(delta.total_seconds() / 60)} minutes"
+              elif hours < 24:
+                  return f"{int(hours)} hours"
+              else:
+                  return f"{int(hours / 24)} days"
+
+          def calculate_velocity(data):
+              """Calculate attack velocity (requests per minute)"""
+              if not data['first_seen'] or not data['last_seen']:
+                  return 0
+              
+              duration = (data['last_seen'] - data['first_seen']).total_seconds()
+              if duration == 0:
+                  return data['count']  # All requests in same second
+              
+              return round(data['count'] / (duration / 60), 2)
+
+          def calculate_risk_score(data):
+              """Calculate risk score based on behavior"""
+              score = 0
+              
+              # Volume-based scoring
+              if data['count'] > 1000:
+                  score += 30
+              elif data['count'] > 100:
+                  score += 20
+              elif data['count'] > 10:
+                  score += 10
+              
+              # Diversity-based scoring
+              endpoint_diversity = len(data['endpoints'])
+              if endpoint_diversity > 50:
+                  score += 30
+              elif endpoint_diversity > 20:
+                  score += 20
+              elif endpoint_diversity > 5:
+                  score += 10
+              
+              # Payload-based scoring
+              malicious_payloads = len(data.get('payloads', []))
+              if malicious_payloads > 10:
+                  score += 40
+              elif malicious_payloads > 5:
+                  score += 30
+              elif malicious_payloads > 0:
+                  score += 20
+              
+              return min(score, 100)  # Cap at 100
+
+          def store_analytics(report):
+              """Store attack analytics in DynamoDB"""
+              try:
+                  # Store aggregated data
+                  for ip_info in report['top_attackers']:
+                      table.put_item(
+                          Item={
+                              'ip_address': ip_info['ip'],
+                              'timestamp': report['timestamp'],
+                              'total_requests': ip_info['total_requests'],
+                              'unique_endpoints': ip_info['unique_endpoints'],
+                              'risk_score': ip_info['risk_score'],
+                              'attack_velocity': str(ip_info['attack_velocity']),
+                              'top_endpoints': json.dumps(ip_info['top_endpoints']),
+                              'ttl': int((datetime.now() + timedelta(days=90)).timestamp())
+                          }
+                      )
+              except Exception as e:
+                  print(f"Failed to store analytics: {e}")
+
+          def should_alert(report):
+              """Determine if alerts should be sent"""
+              # Alert conditions
+              if report['total_attacks'] > 1000:
+                  return True
+              
+              if len(report['high_risk_ips']) > 5:
+                  return True
+              
+              if any(count > 100 for count in report['attack_types'].values()):
+                  return True
+              
+              # Check for high-risk attackers
+              for attacker in report['top_attackers']:
+                  if attacker['risk_score'] > 80:
+                      return True
+              
+              return False
+
+          def send_alerts(report):
+              """Send alerts via SNS and Slack"""
+              message = format_alert_message(report)
+              
+              # Send SNS alert
+              sns_topic = os.environ.get('SNS_TOPIC_ARN')
+              if sns_topic:
+                  try:
+                      sns.publish(
+                          TopicArn=sns_topic,
+                          Subject=f"🚨 FlashBang High-Risk Alert - {report['total_attacks']} attacks detected",
+                          Message=message
+                      )
+                  except Exception as e:
+                      print(f"Failed to send SNS alert: {e}")
+              
+              # Send Slack alert
+              slack_webhook = os.environ.get('SLACK_WEBHOOK')
+              if slack_webhook:
+                  try:
+                      slack_message = format_slack_message(report)
+                      requests.post(slack_webhook, json=slack_message, timeout=10)
+                  except Exception as e:
+                      print(f"Failed to send Slack alert: {e}")
+
+          def format_alert_message(report):
+              """Format alert message for email/SNS"""
+              message = f"""
+          🚨 FlashBang Honeypot Alert Summary
+          
+          📊 Overall Statistics:
+          • Total Attacks: {report['total_attacks']:,}
+          • Unique IPs: {report['unique_ips']:,}
+          • High-Risk IPs: {len(report['high_risk_ips'])}
+          • Honeypot Mode: {report['honeypot_mode'].upper()}
+          
+          🎯 Attack Types Detected:
+          """
+              
+              for attack_type, count in report['attack_types'].items():
+                  message += f"• {attack_type.replace('_', ' ').title()}: {count:,}\n"
+              
+              message += "\n🔥 Top Attackers:\n"
+              for idx, attacker in enumerate(report['top_attackers'][:5], 1):
+                  message += f"\n{idx}. IP: {attacker['ip']}\n"
+                  message += f"   • Requests: {attacker['total_requests']:,}\n"
+                  message += f"   • Risk Score: {attacker['risk_score']}/100\n"
+                  message += f"   • Attack Velocity: {attacker['attack_velocity']} req/min\n"
+                  message += f"   • Duration: {attacker['attack_duration']}\n"
+              
+              if report['enriched_ips']:
+                  message += "\n🕵️ Threat Intelligence:\n"
+                  for enriched in report['enriched_ips'][:3]:
+                      intel = enriched['threat_intel']
+                      if intel.get('abuseipdb'):
+                          abuse_data = intel['abuseipdb']
+                          message += f"\n• {enriched['ip']}:\n"
+                          message += f"  - Abuse Confidence: {abuse_data['abuse_confidence']}%\n"
+                          message += f"  - Country: {abuse_data['country']}\n"
+                          message += f"  - Reports: {abuse_data['total_reports']}\n"
+                          message += f"  - Tags: {', '.join(intel.get('tags', []))}\n"
+              
+              message += f"\n⏰ Report Generated: {report['timestamp']}"
+              
+              return message
+
+          def format_slack_message(report):
+              """Format message for Slack with rich formatting"""
+              high_risk_count = len(report['high_risk_ips'])
+              severity_emoji = "🔴" if high_risk_count > 10 else "🟡" if high_risk_count > 5 else "🟢"
+              
+              # Calculate attack trend
+              attack_trend = "📈" if report['total_attacks'] > 1000 else "📊"
+              
+              attachments = []
+              
+              # Main alert attachment
+              main_attachment = {
+                  "color": "danger" if high_risk_count > 10 else "warning" if high_risk_count > 5 else "good",
+                  "title": f"{severity_emoji} FlashBang Honeypot Alert",
+                  "fields": [
+                      {
+                          "title": "Total Attacks",
+                          "value": f"{report['total_attacks']:,} {attack_trend}",
+                          "short": True
+                      },
+                      {
+                          "title": "Unique Attackers",
+                          "value": f"{report['unique_ips']:,}",
+                          "short": True
+                      },
+                      {
+                          "title": "High-Risk IPs",
+                          "value": f"{high_risk_count}",
+                          "short": True
+                      },
+                      {
+                          "title": "Mode",
+                          "value": report['honeypot_mode'].upper(),
+                          "short": True
+                      }
+                  ],
+                  "footer": "FlashBang Honeypot System",
+                  "ts": int(datetime.now().timestamp())
+              }
+              attachments.append(main_attachment)
+              
+              # Attack types attachment
+              if report['attack_types']:
+                  attack_fields = []
+                  for attack_type, count in sorted(report['attack_types'].items(), 
+                                                 key=lambda x: x[1], reverse=True):
+                      attack_fields.append({
+                          "title": attack_type.replace('_', ' ').title(),
+                          "value": f"{count:,}",
+                          "short": True
+                      })
+                  
+                  attack_attachment = {
+                      "color": "#ff6b6b",
+                      "title": "🎯 Attack Types Detected",
+                      "fields": attack_fields[:6]  # Limit to 6 fields
+                  }
+                  attachments.append(attack_attachment)
+              
+              # Top attackers attachment
+              if report['top_attackers']:
+                  attacker_text = ""
+                  for idx, attacker in enumerate(report['top_attackers'][:3], 1):
+                      risk_emoji = "🔴" if attacker['risk_score'] > 80 else "🟡" if attacker['risk_score'] > 50 else "🟢"
+                      attacker_text += f"{idx}. `{attacker['ip']}` {risk_emoji}\n"
+                      attacker_text += f"   Requests: {attacker['total_requests']:,} | "
+                      attacker_text += f"Risk: {attacker['risk_score']}/100 | "
+                      attacker_text += f"Velocity: {attacker['attack_velocity']} req/min\n\n"
+                  
+                  top_attackers_attachment = {
+                      "color": "#ffd93d",
+                      "title": "🔥 Top Attackers",
+                      "text": attacker_text,
+                      "mrkdwn_in": ["text"]
+                  }
+                  attachments.append(top_attackers_attachment)
+              
+              return {
+                  "text": f"{severity_emoji} FlashBang detected {report['total_attacks']:,} attacks from {report['unique_ips']:,} unique IPs",
+                  "attachments": attachments
+              }
+
+          # Keep only necessary imports at top
