@@ -588,124 +588,124 @@ EOFPIP
           
           # Create FlashBang configuration
           cat > /opt/flashbang/config.json << 'EOFCONFIG'
-{
-  "mode": "${HoneypotMode}",
-  "aws": {
-    "region": "${AWS::Region}",
-    "s3_bucket": "${FlashBangLogsBucket}",
-    "dynamodb_table": "${AttackAnalyticsTable}",
-    "sns_topic": "${FlashBangAlerts}"
-  },
-  "services": {
-    "flask_app": {"enabled": true, "port": 5000, "host": "127.0.0.1"},
-    "ssh_honeypot": {"enabled": ${EnableInteractiveServices}, "port": 2222, "host": "0.0.0.0"},
-    "ftp_honeypot": {"enabled": ${EnableInteractiveServices}, "port": 21, "host": "0.0.0.0"},
-    "telnet_honeypot": {"enabled": ${EnableInteractiveServices}, "port": 23, "host": "0.0.0.0"},
-    "web_honeypot": {"enabled": ${EnableWebHoneypot}, "port": 8080, "host": "127.0.0.1"}
-  },
-  "threat_intel": {
-    "enabled": "${EnableThreatIntel}",
-    "abuseipdb_key": "${AbuseIPDBKey}",
-    "virustotal_key": "${VirusTotalAPIKey}"
-  },
-  "alerting": {
-    "email": "${NotificationEmail}",
-    "slack_webhook": "${SlackWebhookURL}",
-    "sns_topic": "${FlashBangAlerts}"
-  },
-  "logging": {
-    "enable_cloudwatch": ${EnableCloudWatchLogs},
-    "enable_s3_backup": ${EnableS3LogBackup},
-    "log_level": "INFO"
-  }
-}
-EOFCONFIG
+          {
+            "mode": "${HoneypotMode}",
+            "aws": {
+              "region": "${AWS::Region}",
+              "s3_bucket": "${FlashBangLogsBucket}",
+              "dynamodb_table": "${AttackAnalyticsTable}",
+              "sns_topic": "${FlashBangAlerts}"
+            },
+            "services": {
+              "flask_app": {"enabled": true, "port": 5000, "host": "127.0.0.1"},
+              "ssh_honeypot": {"enabled": ${EnableInteractiveServices}, "port": 2222, "host": "0.0.0.0"},
+              "ftp_honeypot": {"enabled": ${EnableInteractiveServices}, "port": 21, "host": "0.0.0.0"},
+              "telnet_honeypot": {"enabled": ${EnableInteractiveServices}, "port": 23, "host": "0.0.0.0"},
+              "web_honeypot": {"enabled": ${EnableWebHoneypot}, "port": 8080, "host": "127.0.0.1"}
+            },
+            "threat_intel": {
+              "enabled": "${EnableThreatIntel}",
+              "abuseipdb_key": "${AbuseIPDBKey}",
+              "virustotal_key": "${VirusTotalAPIKey}"
+            },
+            "alerting": {
+              "email": "${NotificationEmail}",
+              "slack_webhook": "${SlackWebhookURL}",
+              "sns_topic": "${FlashBangAlerts}"
+            },
+            "logging": {
+              "enable_cloudwatch": ${EnableCloudWatchLogs},
+              "enable_s3_backup": ${EnableS3LogBackup},
+              "log_level": "INFO"
+            }
+          }
+          EOFCONFIG
           
           # Set environment variables
           cat > /opt/flashbang/.env << 'EOFENV'
-FLASK_ENV=production
-FLASK_APP=app.py
-AWS_REGION=${AWS::Region}
-AWS_DEFAULT_REGION=${AWS::Region}
-HONEYPOT_MODE=${HoneypotMode}
-ENABLE_THREAT_INTEL=${EnableThreatIntel}
-ABUSEIPDB_KEY=${AbuseIPDBKey}
-VIRUSTOTAL_API_KEY=${VirusTotalAPIKey}
-SNS_TOPIC_ARN=${FlashBangAlerts}
-SLACK_WEBHOOK_URL=${SlackWebhookURL}
-S3_BUCKET=${FlashBangLogsBucket}
-DYNAMODB_TABLE=${AttackAnalyticsTable}
-ENABLE_S3_BACKUP=${EnableS3LogBackup}
-ENABLE_CLOUDWATCH_LOGS=${EnableCloudWatchLogs}
-EOFENV
+          FLASK_ENV=production
+          FLASK_APP=app.py
+          AWS_REGION=${AWS::Region}
+          AWS_DEFAULT_REGION=${AWS::Region}
+          HONEYPOT_MODE=${HoneypotMode}
+          ENABLE_THREAT_INTEL=${EnableThreatIntel}
+          ABUSEIPDB_KEY=${AbuseIPDBKey}
+          VIRUSTOTAL_API_KEY=${VirusTotalAPIKey}
+          SNS_TOPIC_ARN=${FlashBangAlerts}
+          SLACK_WEBHOOK_URL=${SlackWebhookURL}
+          S3_BUCKET=${FlashBangLogsBucket}
+          DYNAMODB_TABLE=${AttackAnalyticsTable}
+          ENABLE_S3_BACKUP=${EnableS3LogBackup}
+          ENABLE_CLOUDWATCH_LOGS=${EnableCloudWatchLogs}
+          EOFENV
           
           # Configure Nginx for FlashBang
           cat > /etc/nginx/conf.d/flashbang.conf << 'EOFNGINX'
-# FlashBang Honeypot Nginx Configuration
-
-log_format flashbang_format '$remote_addr - $remote_user [$time_local] '
-                           '"$request" $status $body_bytes_sent '
-                           '"$http_referer" "$http_user_agent" '
-                           '"$http_x_forwarded_for" "$request_time"';
-
-upstream flask_app {
-    server 127.0.0.1:5000;
-}
-
-upstream web_honeypot {
-    server 127.0.0.1:8080;
-}
-
-server {
-    listen 80 default_server;
-    server_name _;
-    
-    # Real IP handling
-    real_ip_header X-Forwarded-For;
-    real_ip_recursive on;
-    
-    # Custom logging for attack analysis
-    access_log /var/log/nginx/flashbang_access.log flashbang_format;
-    error_log /var/log/nginx/flashbang_error.log;
-    
-    # Rate limiting for protection
-    limit_req_zone $binary_remote_addr zone=flashbang:10m rate=10r/s;
-    limit_req zone=flashbang burst=20 nodelay;
-    
-    # Main Flask application
-    location / {
-        proxy_pass http://flask_app;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 300s;
-        proxy_connect_timeout 75s;
-    }
-    
-    # Web application honeypot for specific vulnerable paths
-    location ~ ^/(admin|wp-admin|phpmyadmin|cPanel|webmin) {
-        proxy_pass http://web_honeypot;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    }
-    
-    # Honeypot endpoints for common attack vectors
-    location ~ \.(env|git|sql|bak|backup|db|config|log)$ {
-        proxy_pass http://flask_app;
-        access_log /var/log/nginx/flashbang_attacks.log flashbang_format;
-    }
-    
-    # API endpoints for web honeypot
-    location /api/ {
-        proxy_pass http://web_honeypot;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    }
-}
-EOFNGINX
+          # FlashBang Honeypot Nginx Configuration
+          
+          log_format flashbang_format '$remote_addr - $remote_user [$time_local] '
+                                 '"$request" $status $body_bytes_sent '
+                                 '"$http_referer" "$http_user_agent" '
+                                 '"$http_x_forwarded_for" "$request_time"';
+          
+          upstream flask_app {
+              server 127.0.0.1:5000;
+          }
+          
+          upstream web_honeypot {
+              server 127.0.0.1:8080;
+          }
+          
+          server {
+              listen 80 default_server;
+              server_name _;
+              
+              # Real IP handling
+              real_ip_header X-Forwarded-For;
+              real_ip_recursive on;
+              
+              # Custom logging for attack analysis
+              access_log /var/log/nginx/flashbang_access.log flashbang_format;
+              error_log /var/log/nginx/flashbang_error.log;
+              
+              # Rate limiting for protection
+              limit_req_zone $binary_remote_addr zone=flashbang:10m rate=10r/s;
+              limit_req zone=flashbang burst=20 nodelay;
+              
+              # Main Flask application
+              location / {
+                  proxy_pass http://flask_app;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_read_timeout 300s;
+                  proxy_connect_timeout 75s;
+              }
+              
+              # Web application honeypot for specific vulnerable paths
+              location ~ ^/(admin|wp-admin|phpmyadmin|cPanel|webmin) {
+                  proxy_pass http://web_honeypot;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              }
+              
+              # Honeypot endpoints for common attack vectors
+              location ~ \.(env|git|sql|bak|backup|db|config|log)$ {
+                  proxy_pass http://flask_app;
+                  access_log /var/log/nginx/flashbang_attacks.log flashbang_format;
+              }
+              
+              # API endpoints for web honeypot
+              location /api/ {
+                  proxy_pass http://web_honeypot;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              }
+          }
+          EOFNGINX
           
           # Remove default Nginx config
           rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
@@ -713,95 +713,95 @@ EOFNGINX
           # Create basic Flask app if it doesn't exist
           if [ ! -f /opt/flashbang/app.py ]; then
             cat > /opt/flashbang/app.py << 'EOFFLASK'
-from flask import Flask, request, render_template_string, redirect
-import boto3
-import json
-import os
-from datetime import datetime
-import logging
-
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
-
-# Initialize AWS clients
-try:
-    s3 = boto3.client('s3')
-    dynamodb = boto3.resource('dynamodb')
-    sns = boto3.client('sns')
-except:
-    print("AWS clients not available - running in local mode")
-    s3 = dynamodb = sns = None
-
-def log_attack(endpoint, ip, user_agent, headers):
-    """Log attack attempt to multiple destinations"""
-    attack_data = {
-        'timestamp': datetime.now().isoformat(),
-        'endpoint': endpoint,
-        'ip': ip,
-        'user_agent': user_agent,
-        'headers': dict(headers)
-    }
-    
-    # Log to file
-    with open('/opt/flashbang/logs/attacks.log', 'a') as f:
-        f.write(f"{json.dumps(attack_data)}\n")
-    
-    # Log to CloudWatch via print (picked up by CloudWatch agent)
-    print(f"FlashBang attack attempt: {json.dumps(attack_data)}")
-    
-    return attack_data
-
-@app.route('/')
-def home():
-    log_attack('/', request.remote_addr, request.user_agent.string, request.headers)
-    return render_template_string("""
-    <html><head><title>Welcome to FlashBang! 🎯</title></head>
-    <body>
-        <h1>🎯 FlashBang Honeypot System</h1>
-        <p>Welcome to our totally legitimate web server!</p>
-        <p>Nothing suspicious here... 🎭</p>
-        <ul>
-            <li><a href="/admin">Admin Panel</a></li>
-            <li><a href="/.env">Environment File</a></li>
-            <li><a href="/api/users">User API</a></li>
-            <li><a href="/shell">Shell Access</a></li>
-        </ul>
-    </body></html>
-    """)
-
-@app.route('/admin')
-def admin():
-    log_attack('/admin', request.remote_addr, request.user_agent.string, request.headers)
-    return "Admin panel under construction... 🚧"
-
-@app.route('/.env')
-def env_file():
-    log_attack('/.env', request.remote_addr, request.user_agent.string, request.headers)
-    return """
-    # Fake environment file
-    DB_PASSWORD=definitely_not_the_real_password
-    API_KEY=fake_key_12345
-    SECRET_TOKEN=this_is_not_real
-    """
-
-@app.route('/shell')
-def shell():
-    log_attack('/shell', request.remote_addr, request.user_agent.string, request.headers)
-    return redirect('https://www.youtube.com/watch?v=dQw4w9WgXcQ')  # Rickroll!
-
-@app.route('/rickroll')
-def rickroll():
-    log_attack('/rickroll', request.remote_addr, request.user_agent.string, request.headers)
-    return redirect('https://www.youtube.com/watch?v=dQw4w9WgXcQ')
-
-@app.route('/health-check-fake-endpoint')
-def health_check():
-    return "OK", 200
-
-if __name__ == '__main__':
-    os.makedirs('/opt/flashbang/logs', exist_ok=True)
-    app.run(host='127.0.0.1', port=5000, debug=False)
-EOFFLASK
+            from flask import Flask, request, render_template_string, redirect
+            import boto3
+            import json
+            import os
+            from datetime import datetime
+            import logging
+            
+            app = Flask(__name__)
+            logging.basicConfig(level=logging.INFO)
+            
+            # Initialize AWS clients
+            try:
+                s3 = boto3.client('s3')
+                dynamodb = boto3.resource('dynamodb')
+                sns = boto3.client('sns')
+            except:
+                print("AWS clients not available - running in local mode")
+                s3 = dynamodb = sns = None
+            
+            def log_attack(endpoint, ip, user_agent, headers):
+                """Log attack attempt to multiple destinations"""
+                attack_data = {
+                    'timestamp': datetime.now().isoformat(),
+                    'endpoint': endpoint,
+                    'ip': ip,
+                    'user_agent': user_agent,
+                    'headers': dict(headers)
+                }
+                
+                # Log to file
+                with open('/opt/flashbang/logs/attacks.log', 'a') as f:
+                    f.write(f"{json.dumps(attack_data)}\n")
+                
+                # Log to CloudWatch via print (picked up by CloudWatch agent)
+                print(f"FlashBang attack attempt: {json.dumps(attack_data)}")
+                
+                return attack_data
+            
+            @app.route('/')
+            def home():
+                log_attack('/', request.remote_addr, request.user_agent.string, request.headers)
+                return render_template_string("""
+                <html><head><title>Welcome to FlashBang! 🎯</title></head>
+                <body>
+                    <h1>🎯 FlashBang Honeypot System</h1>
+                    <p>Welcome to our totally legitimate web server!</p>
+                    <p>Nothing suspicious here... 🎭</p>
+                    <ul>
+                        <li><a href="/admin">Admin Panel</a></li>
+                        <li><a href="/.env">Environment File</a></li>
+                        <li><a href="/api/users">User API</a></li>
+                        <li><a href="/shell">Shell Access</a></li>
+                    </ul>
+                </body></html>
+                """)
+            
+            @app.route('/admin')
+            def admin():
+                log_attack('/admin', request.remote_addr, request.user_agent.string, request.headers)
+                return "Admin panel under construction... 🚧"
+            
+            @app.route('/.env')
+            def env_file():
+                log_attack('/.env', request.remote_addr, request.user_agent.string, request.headers)
+                return """
+                # Fake environment file
+                DB_PASSWORD=definitely_not_the_real_password
+                API_KEY=fake_key_12345
+                SECRET_TOKEN=this_is_not_real
+                """
+            
+            @app.route('/shell')
+            def shell():
+                log_attack('/shell', request.remote_addr, request.user_agent.string, request.headers)
+                return redirect('https://www.youtube.com/watch?v=dQw4w9WgXcQ')  # Rickroll!
+            
+            @app.route('/rickroll')
+            def rickroll():
+                log_attack('/rickroll', request.remote_addr, request.user_agent.string, request.headers)
+                return redirect('https://www.youtube.com/watch?v=dQw4w9WgXcQ')
+            
+            @app.route('/health-check-fake-endpoint')
+            def health_check():
+                return "OK", 200
+            
+            if __name__ == '__main__':
+                os.makedirs('/opt/flashbang/logs', exist_ok=True)
+                app.run(host='127.0.0.1', port=5000, debug=False)
+            EOFFLASK
           fi
           
           # Create basic interactive services if they don't exist
