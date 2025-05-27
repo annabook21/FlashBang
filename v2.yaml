@@ -1,0 +1,2311 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Complete FlashBang Honeypot with Enhanced Security, Monitoring, and Multi-Service Support
+
+Parameters:
+  # Network Configuration
+  MyIP:
+    Type: String
+    Description: Your IP address to allow SSH access (e.g., 203.0.113.0/32)
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid CIDR notation (e.g., 203.0.113.0/32)
+
+  MyVPC:
+    Type: AWS::EC2::VPC::Id
+    Description: The VPC to launch the instance in
+
+  PublicSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of public subnets for ALB (minimum 2 in different AZs)
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet for honeypot instance (more secure)
+
+  # Instance Configuration
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.micro, t3.small, t3.medium, t3.large]
+    Description: EC2 instance type
+
+  # FlashBang Configuration
+  FlashBangGitRepo:
+    Type: String
+    Default: "https://github.com/your-org/flashbang-honeypot.git"
+    Description: Git repository URL for FlashBang source code
+
+  HoneypotMode:
+    Type: String
+    Default: "medium"
+    AllowedValues: ["low", "medium", "high"]
+    Description: Honeypot interaction level per FlashBang documentation
+
+  EnableInteractiveServices:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable SSH, FTP, Telnet honeypots
+
+  EnableWebHoneypot:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable web application honeypot module
+
+  EnableContainerServices:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Enable Docker-based honeypot services
+
+  # Security & Monitoring
+  NotificationEmail:
+    Type: String
+    Description: Email address for attack notifications (optional)
+    Default: ""
+
+  SlackWebhookURL:
+    Type: String
+    Description: Slack webhook URL for real-time alerts (optional)
+    Default: ""
+    NoEcho: true
+
+  EnableCloudWatchLogs:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable CloudWatch logging for attack attempts
+
+  EnableS3LogBackup:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable S3 backup for logs and Lambda processing
+
+  EnableWAF:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Enable AWS WAF for additional protection
+
+  # Threat Intelligence
+  EnableThreatIntel:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Enable threat intelligence enrichment
+
+  AbuseIPDBKey:
+    Type: String
+    Description: AbuseIPDB API key for threat intelligence (optional)
+    Default: ""
+    NoEcho: true
+
+  VirusTotalAPIKey:
+    Type: String
+    Description: VirusTotal API key for malware analysis (optional)
+    Default: ""
+    NoEcho: true
+
+  # HTTPS Configuration
+  EnableHTTPS:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable HTTPS with ALB and ACM
+
+  DomainName:
+    Type: String
+    Description: Domain name for HTTPS certificate (e.g., honeypot.example.com)
+    Default: ""
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - MyVPC
+          - PublicSubnets
+          - PrivateSubnet
+          - MyIP
+      - Label:
+          default: "Instance Configuration"
+        Parameters:
+          - InstanceType
+          - KeyName
+          - FlashBangGitRepo
+      - Label:
+          default: "FlashBang Configuration"
+        Parameters:
+          - HoneypotMode
+          - EnableInteractiveServices
+          - EnableWebHoneypot
+          - EnableContainerServices
+      - Label:
+          default: "Security & Monitoring"
+        Parameters:
+          - EnableCloudWatchLogs
+          - EnableS3LogBackup
+          - EnableWAF
+          - NotificationEmail
+          - SlackWebhookURL
+      - Label:
+          default: "Threat Intelligence"
+        Parameters:
+          - EnableThreatIntel
+          - AbuseIPDBKey
+          - VirusTotalAPIKey
+      - Label:
+          default: "HTTPS Configuration"
+        Parameters:
+          - EnableHTTPS
+          - DomainName
+
+Conditions:
+  # Alerting Conditions
+  CreateSNSTopic: !Not [!Equals [!Ref NotificationEmail, ""]]
+  EnableSlack: !Not [!Equals [!Ref SlackWebhookURL, ""]]
+  
+  # Feature Conditions
+  EnableLogging: !Equals [!Ref EnableCloudWatchLogs, "true"]
+  EnableS3Backup: !Equals [!Ref EnableS3LogBackup, "true"]
+  EnableContainers: !Equals [!Ref EnableContainerServices, "true"]
+  EnableWAF: !Equals [!Ref EnableWAF, "true"]
+  
+  # Threat Intelligence Conditions
+  EnableThreatIntel: !And 
+    - !Equals [!Ref EnableThreatIntel, "true"]
+    - !Not [!Equals [!Ref AbuseIPDBKey, ""]]
+  EnableVirusTotal: !Not [!Equals [!Ref VirusTotalAPIKey, ""]]
+  
+  # HTTPS Conditions
+  EnableHTTPS: !And
+    - !Equals [!Ref EnableHTTPS, "true"]
+    - !Not [!Equals [!Ref DomainName, ""]]
+  
+  # FlashBang Mode Conditions
+  HighInteraction: !Equals [!Ref HoneypotMode, "high"]
+  MediumInteraction: !Equals [!Ref HoneypotMode, "medium"]
+  LowInteraction: !Equals [!Ref HoneypotMode, "low"]
+
+Resources:
+  # Latest AMI ID Parameter
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+  # SNS Topic for Email Alerts
+  FlashBangAlerts:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSTopic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-flashbang-alerts"
+      DisplayName: "FlashBang Honeypot Alerts"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  # S3 Bucket for Log Storage and Malware Samples
+  FlashBangLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-flashbang-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpirationInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt FlashBangLogProcessorLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: logs/
+
+  # DynamoDB Table for Attack Analytics
+  AttackAnalyticsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-AttackAnalytics"
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: ip_address
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+        - AttributeName: endpoint
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ip_address
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: endpoint-timestamp-index
+          KeySchema:
+            - AttributeName: endpoint
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Purpose
+          Value: FlashBang-Analytics
+
+  # CloudWatch Log Group for FlashBang
+  FlashBangLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/ec2/${AWS::StackName}/flashbang"
+      RetentionInDays: 30
+      Tags:
+        - Key: Purpose
+          Value: FlashBang-Logging
+
+  # Security Groups
+  FlashBangSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${AWS::StackName}-flashbang-sg"
+      GroupDescription: Security group for FlashBang honeypot with all service ports
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        # Administrative access
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MyIP
+          Description: SSH admin access
+        # HTTP/HTTPS from ALB
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: HTTP from ALB
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: HTTPS from ALB
+        # FlashBang honeypot services (direct access)
+        - IpProtocol: tcp
+          FromPort: 21
+          ToPort: 21
+          CidrIp: 0.0.0.0/0
+          Description: FTP honeypot
+        - IpProtocol: tcp
+          FromPort: 23
+          ToPort: 23
+          CidrIp: 0.0.0.0/0
+          Description: Telnet honeypot
+        - IpProtocol: tcp
+          FromPort: 2222
+          ToPort: 2222
+          CidrIp: 0.0.0.0/0
+          Description: SSH honeypot
+        # Database honeypots
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 0.0.0.0/0
+          Description: MySQL honeypot
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 0.0.0.0/0
+          Description: PostgreSQL honeypot
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          CidrIp: 0.0.0.0/0
+          Description: Redis honeypot
+        # Windows services
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: 0.0.0.0/0
+          Description: RDP honeypot
+        - IpProtocol: tcp
+          FromPort: 445
+          ToPort: 445
+          CidrIp: 0.0.0.0/0
+          Description: SMB honeypot
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-flashbang-sg"
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from internet
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS from internet
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-alb-sg"
+
+  # Application Load Balancer
+  HoneypotALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-alb"
+      Type: application
+      Scheme: internet-facing
+      Subnets: !Ref PublicSubnets
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-alb"
+        - Key: Purpose
+          Value: FlashBang-LoadBalancer
+
+  HoneypotTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-tg"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref MyVPC
+      HealthCheckPath: /health-check-fake-endpoint
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      Targets:
+        - Id: !Ref FlashBangInstance
+          Port: 80
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref HoneypotALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref HoneypotTargetGroup
+
+  # HTTPS Listener (conditional)
+  ALBListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: EnableHTTPS
+    Properties:
+      LoadBalancerArn: !Ref HoneypotALB
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref SSLCertificate
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref HoneypotTargetGroup
+
+  # SSL Certificate (conditional)
+  SSLCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: EnableHTTPS
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-cert"
+
+# IAM Roles and Instance Profile
+  FlashBangInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-flashbang-instance-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: FlashBangInstancePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub "${FlashBangLogsBucket}/*"
+                  - !GetAtt FlashBangLogsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource: 
+                  - !GetAtt AttackAnalyticsTable.Arn
+                  - !Sub "${AttackAnalyticsTable.Arn}/index/*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If [CreateSNSTopic, !Ref FlashBangAlerts, !Ref "AWS::NoValue"]
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+
+  FlashBangInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${AWS::StackName}-flashbang-profile"
+      Roles:
+        - !Ref FlashBangInstanceRole
+
+  # FlashBang EC2 Instance
+  FlashBangInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref FlashBangSecurityGroup
+      IamInstanceProfile: !Ref FlashBangInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          
+          # Logging setup
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          echo "FlashBang deployment started at $(date)"
+          
+          # System updates and dependencies
+          yum update -y
+          yum install -y python3 python3-pip git nginx docker sqlite3 htop fail2ban jq wget curl
+          
+          # Install Node.js for potential web components
+          curl -sL https://rpm.nodesource.com/setup_18.x | bash -
+          yum install -y nodejs
+          
+          # Install Docker Compose
+          curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          chmod +x /usr/local/bin/docker-compose
+          
+          # Start and enable services
+          systemctl start docker nginx
+          systemctl enable docker nginx
+          usermod -aG docker ec2-user
+          
+          # Create FlashBang directories
+          mkdir -p /opt/flashbang/{logs,data,certs,scripts,backup}
+          chown -R ec2-user:ec2-user /opt/flashbang
+          
+          # Clone FlashBang repository
+          cd /opt
+          echo "Cloning FlashBang repository..."
+          git clone ${FlashBangGitRepo} flashbang-src || echo "Git clone failed, using fallback"
+          
+          # Copy source files
+          if [ -d "flashbang-src" ]; then
+          cp -r flashbang-src/* flashbang/ 2>/dev/null || echo "Copy completed with some warnings"
+          else
+          echo "Creating fallback FlashBang structure..."
+          mkdir -p /opt/flashbang/{templates,static}
+          fi
+          
+          # Install Python dependencies
+          cd /opt/flashbang
+          
+          # Create requirements.txt if it doesn't exist
+          if [ ! -f requirements.txt ]; then
+          cat > requirements.txt << 'EOFPIP'
+          flask==2.3.3
+          flask-limiter==3.3.1
+          boto3==1.28.40
+          requests==2.31.0
+          aiofiles==23.2.1
+          asyncio==3.4.3
+          asyncssh==2.13.2
+          pyftpdlib==1.5.7
+          redis==5.0.0
+          psutil==5.9.5
+          EOFPIP
+          fi
+          
+          pip3 install -r requirements.txt || pip3 install flask flask-limiter boto3 requests aiofiles asyncssh pyftpdlib redis psutil
+          
+          # Create FlashBang configuration
+          cat > /opt/flashbang/config.json << 'EOFCONFIG'
+          {
+          "mode": "${HoneypotMode}",
+          "aws": {
+          "region": "${AWS::Region}",
+          "s3_bucket": "${FlashBangLogsBucket}",
+          "dynamodb_table": "${AttackAnalyticsTable}",
+          "sns_topic": "${FlashBangAlerts}"
+          },
+          "services": {
+          "flask_app": {"enabled": true, "port": 5000, "host": "127.0.0.1"},
+          "ssh_honeypot": {"enabled": ${EnableInteractiveServices}, "port": 2222, "host": "0.0.0.0"},
+          "ftp_honeypot": {"enabled": ${EnableInteractiveServices}, "port": 21, "host": "0.0.0.0"},
+          "telnet_honeypot": {"enabled": ${EnableInteractiveServices}, "port": 23, "host": "0.0.0.0"},
+          "web_honeypot": {"enabled": ${EnableWebHoneypot}, "port": 8080, "host": "127.0.0.1"}
+          },
+          "threat_intel": {
+          "enabled": "${EnableThreatIntel}",
+          "abuseipdb_key": "${AbuseIPDBKey}",
+          "virustotal_key": "${VirusTotalAPIKey}"
+          },
+          "alerting": {
+          "email": "${NotificationEmail}",
+          "slack_webhook": "${SlackWebhookURL}",
+          "sns_topic": "${FlashBangAlerts}"
+          },
+          "logging": {
+          "enable_cloudwatch": ${EnableCloudWatchLogs},
+          "enable_s3_backup": ${EnableS3LogBackup},
+          "log_level": "INFO"
+          }
+          }
+          EOFCONFIG
+          
+          # Set environment variables
+          cat > /opt/flashbang/.env << 'EOFENV'
+          FLASK_ENV=production
+          FLASK_APP=app.py
+          AWS_REGION=${AWS::Region}
+          AWS_DEFAULT_REGION=${AWS::Region}
+          HONEYPOT_MODE=${HoneypotMode}
+          ENABLE_THREAT_INTEL=${EnableThreatIntel}
+          ABUSEIPDB_KEY=${AbuseIPDBKey}
+          VIRUSTOTAL_API_KEY=${VirusTotalAPIKey}
+          SNS_TOPIC_ARN=${FlashBangAlerts}
+          SLACK_WEBHOOK_URL=${SlackWebhookURL}
+          S3_BUCKET=${FlashBangLogsBucket}
+          DYNAMODB_TABLE=${AttackAnalyticsTable}
+          ENABLE_S3_BACKUP=${EnableS3LogBackup}
+          ENABLE_CLOUDWATCH_LOGS=${EnableCloudWatchLogs}
+          EOFENV
+          
+          # Configure Nginx for FlashBang
+          cat > /etc/nginx/conf.d/flashbang.conf << 'EOFNGINX'
+          # FlashBang Honeypot Nginx Configuration
+          
+          log_format flashbang_format '$remote_addr - $remote_user [$time_local] '
+          '"$request" $status $body_bytes_sent '
+          '"$http_referer" "$http_user_agent" '
+          '"$http_x_forwarded_for" "$request_time"';
+          
+          upstream flask_app {
+          server 127.0.0.1:5000;
+          }
+          
+          upstream web_honeypot {
+          server 127.0.0.1:8080;
+          }
+          
+          server {
+          listen 80 default_server;
+          server_name _;
+              
+          # Real IP handling
+          real_ip_header X-Forwarded-For;
+          real_ip_recursive on;
+              
+          # Custom logging for attack analysis
+          access_log /var/log/nginx/flashbang_access.log flashbang_format;
+          error_log /var/log/nginx/flashbang_error.log;
+              
+          # Rate limiting for protection
+          limit_req_zone $binary_remote_addr zone=flashbang:10m rate=10r/s;
+          limit_req zone=flashbang burst=20 nodelay;
+              
+          # Main Flask application
+          location / {
+          proxy_pass http://flask_app;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_read_timeout 300s;
+          proxy_connect_timeout 75s;
+          }
+              
+          # Web application honeypot for specific vulnerable paths
+          location ~ ^/(admin|wp-admin|phpmyadmin|cPanel|webmin) {
+          proxy_pass http://web_honeypot;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          }
+              
+          # Honeypot endpoints for common attack vectors
+          location ~ \.(env|git|sql|bak|backup|db|config|log)$ {
+          proxy_pass http://flask_app;
+          access_log /var/log/nginx/flashbang_attacks.log flashbang_format;
+          }
+              
+          # API endpoints for web honeypot
+          location /api/ {
+          proxy_pass http://web_honeypot;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          }
+          }
+          EOFNGINX
+          
+          # Remove default Nginx config
+          rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
+          
+          # Create basic Flask app if it doesn't exist
+          if [ ! -f /opt/flashbang/app.py ]; then
+          cat > /opt/flashbang/app.py << 'EOFFLASK'
+          from flask import Flask, request, render_template_string, redirect
+          import boto3
+          import json
+          import os
+          from datetime import datetime
+          import logging
+
+          app = Flask(__name__)
+          logging.basicConfig(level=logging.INFO)
+
+          # Initialize AWS clients
+          try:
+          s3 = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          except:
+          print("AWS clients not available - running in local mode")
+          s3 = dynamodb = sns = None
+
+          def log_attack(endpoint, ip, user_agent, headers):
+          """Log attack attempt to multiple destinations"""
+          attack_data = {
+          'timestamp': datetime.now().isoformat(),
+          'endpoint': endpoint,
+          'ip': ip,
+          'user_agent': user_agent,
+          'headers': dict(headers)
+          }
+    
+          # Log to file
+          with open('/opt/flashbang/logs/attacks.log', 'a') as f:
+          f.write(f"{json.dumps(attack_data)}\n")
+    
+          # Log to CloudWatch via print (picked up by CloudWatch agent)
+          print(f"FlashBang attack attempt: {json.dumps(attack_data)}")
+    
+          return attack_data
+
+          @app.route('/')
+          def home():
+          log_attack('/', request.remote_addr, request.user_agent.string, request.headers)
+          return render_template_string("""
+          <html><head><title>Welcome to FlashBang! 🎯</title></head>
+          <body>
+          <h1>🎯 FlashBang Honeypot System</h1>
+          <p>Welcome to our totally legitimate web server!</p>
+          <p>Nothing suspicious here... 🎭</p>
+          <ul>
+          <li><a href="/admin">Admin Panel</a></li>
+          <li><a href="/.env">Environment File</a></li>
+          <li><a href="/api/users">User API</a></li>
+          <li><a href="/shell">Shell Access</a></li>
+          </ul>
+          </body></html>
+          """)
+
+          @app.route('/admin')
+          def admin():
+          log_attack('/admin', request.remote_addr, request.user_agent.string, request.headers)
+          return "Admin panel under construction... 🚧"
+
+          @app.route('/.env')
+          def env_file():
+          log_attack('/.env', request.remote_addr, request.user_agent.string, request.headers)
+          return """
+          # Fake environment file
+          DB_PASSWORD=definitely_not_the_real_password
+          API_KEY=fake_key_12345
+          SECRET_TOKEN=this_is_not_real
+          """
+
+          @app.route('/shell')
+          def shell():
+          log_attack('/shell', request.remote_addr, request.user_agent.string, request.headers)
+          return redirect('https://www.youtube.com/watch?v=dQw4w9WgXcQ')  # Rickroll!
+
+          @app.route('/rickroll')
+          def rickroll():
+          log_attack('/rickroll', request.remote_addr, request.user_agent.string, request.headers)
+          return redirect('https://www.youtube.com/watch?v=dQw4w9WgXcQ')
+
+          @app.route('/health-check-fake-endpoint')
+          def health_check():
+          return "OK", 200
+
+          if __name__ == '__main__':
+          os.makedirs('/opt/flashbang/logs', exist_ok=True)
+          app.run(host='127.0.0.1', port=5000, debug=False)
+          EOFFLASK
+          fi
+          
+          # Create basic interactive services if they don't exist
+          if [ ! -f /opt/flashbang/interactive_services.py ]; then
+          cat > /opt/flashbang/interactive_services.py << 'EOFINTERACTIVE'
+          import asyncio
+          import logging
+          import json
+          from datetime import datetime
+
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger(__name__)
+
+          class SimpleHoneypot:
+          def __init__(self, port, service_name):
+          self.port = port
+          self.service_name = service_name
+    
+          async def handle_connection(self, reader, writer):
+          addr = writer.get_extra_info('peername')
+          logger.info(f"FlashBang {self.service_name} connection from {addr}")
+        
+          # Log the connection
+          with open(f'/opt/flashbang/logs/{self.service_name}.log', 'a') as f:
+          f.write(f"{datetime.now().isoformat()} - Connection from {addr}\n")
+        
+          # Send fake banner
+          if self.service_name == 'ssh':
+          writer.write(b'SSH-2.0-OpenSSH_8.0\r\n')
+          elif self.service_name == 'ftp':
+          writer.write(b'220 Welcome to FTP server\r\n')
+          elif self.service_name == 'telnet':
+          writer.write(b'Welcome to Telnet\r\n')
+        
+          await writer.drain()
+          writer.close()
+    
+          async def start(self):
+          server = await asyncio.start_server(
+          self.handle_connection, '0.0.0.0', self.port
+          )
+          logger.info(f"FlashBang {self.service_name} honeypot running on port {self.port}")
+          async with server:
+          await server.serve_forever()
+
+          async def main():
+          # Start multiple honeypot services
+          ssh_honeypot = SimpleHoneypot(2222, 'ssh')
+          ftp_honeypot = SimpleHoneypot(21, 'ftp')
+          telnet_honeypot = SimpleHoneypot(23, 'telnet')
+    
+          # Run all services concurrently
+          await asyncio.gather(
+          ssh_honeypot.start(),
+          ftp_honeypot.start(),
+          telnet_honeypot.start()
+          )
+
+          if __name__ == '__main__':
+          asyncio.run(main())
+          EOFINTERACTIVE
+          fi
+          
+          # Create basic web honeypot if it doesn't exist
+          if [ ! -f /opt/flashbang/web_honeypot.py ]; then
+          cat > /opt/flashbang/web_honeypot.py << 'EOFWEB'
+          from flask import Flask, request, jsonify
+          import json
+          import logging
+          from datetime import datetime
+
+          app = Flask(__name__)
+          logging.basicConfig(level=logging.INFO)
+
+          def log_web_attack(endpoint, data):
+          with open('/opt/flashbang/logs/web_attacks.log', 'a') as f:
+          f.write(f"{json.dumps(data)}\n")
+
+          @app.route('/admin')
+          def admin_panel():
+          log_web_attack('/admin', {
+          'timestamp': datetime.now().isoformat(),
+          'endpoint': '/admin',
+          'ip': request.remote_addr,
+          'user_agent': request.user_agent.string
+          })
+          return "Administrative access restricted"
+
+          @app.route('/api/users')
+          def api_users():
+          return jsonify({"users": ["admin", "test", "user1"]})
+
+          if __name__ == '__main__':
+          app.run(host='127.0.0.1', port=8080, debug=False)
+          EOFWEB
+          fi
+          
+          echo "FlashBang application files created successfully"
+          
+          # Set proper permissions
+          chown -R ec2-user:ec2-user /opt/flashbang
+          chmod -R 755 /opt/flashbang
+          
+          echo "FlashBang EC2 instance setup completed at $(date)"
+          
+          # Create systemd services for FlashBang components
+          
+          # Main Flask app service
+          cat > /etc/systemd/system/flashbang-flask.service << 'EOFFLASKSERVICE'
+          [Unit]
+          Description=FlashBang Flask Honeypot
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=ec2-user
+          Group=ec2-user
+          WorkingDirectory=/opt/flashbang
+          Environment=PATH=/usr/local/bin:/usr/bin:/bin
+          EnvironmentFile=/opt/flashbang/.env
+          ExecStart=/usr/bin/python3 /opt/flashbang/app.py
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+          EOFFLASKSERVICE
+
+          # Interactive services honeypot
+          cat > /etc/systemd/system/flashbang-interactive.service << 'EOFINTERACTIVESERVICE'
+          [Unit]
+          Description=FlashBang Interactive Services Honeypot
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=ec2-user
+          Group=ec2-user
+          WorkingDirectory=/opt/flashbang
+          Environment=PATH=/usr/local/bin:/usr/bin:/bin
+          EnvironmentFile=/opt/flashbang/.env
+          ExecStart=/usr/bin/python3 /opt/flashbang/interactive_services.py
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+          EOFINTERACTIVESERVICE
+
+          # Web application honeypot
+          cat > /etc/systemd/system/flashbang-web.service << 'EOFWEBSERVICE'
+          [Unit]
+          Description=FlashBang Web Application Honeypot
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=ec2-user
+          Group=ec2-user
+          WorkingDirectory=/opt/flashbang
+          Environment=PATH=/usr/local/bin:/usr/bin:/bin
+          EnvironmentFile=/opt/flashbang/.env
+          ExecStart=/usr/bin/python3 /opt/flashbang/web_honeypot.py
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+          EOFWEBSERVICE
+
+          # Log rotation configuration
+          cat > /etc/logrotate.d/flashbang << 'EOFLOGROTATE'
+          /opt/flashbang/logs/*.log {
+          daily
+          missingok
+          rotate 30
+          compress
+          delaycompress
+          notifempty
+          create 644 ec2-user ec2-user
+          postrotate
+          /bin/kill -USR1 `cat /run/nginx.pid 2>/dev/null` 2>/dev/null || true
+          endscript
+          }
+
+          /var/log/nginx/flashbang_*.log {
+          daily
+          missingok
+          rotate 30
+          compress
+          delaycompress
+          notifempty
+          create 644 nginx nginx
+          postrotate
+          /bin/kill -USR1 `cat /run/nginx.pid 2>/dev/null` 2>/dev/null || true
+          endscript
+          }
+          EOFLOGROTATE
+
+          # Install CloudWatch agent for advanced monitoring
+          echo "Installing CloudWatch agent..."
+          wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+          rpm -U ./amazon-cloudwatch-agent.rpm
+
+          # CloudWatch agent configuration
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOFCWAGENT'
+          {
+          "agent": {
+          "run_as_user": "root"
+          },
+          "logs": {
+          "logs_collected": {
+          "files": {
+          "collect_list": [
+          {
+          "file_path": "/opt/flashbang/logs/attacks.log",
+          "log_group_name": "${FlashBangLogGroup}",
+          "log_stream_name": "{instance_id}/flashbang-attacks",
+          "timezone": "UTC"
+          },
+          {
+          "file_path": "/opt/flashbang/logs/ssh.log",
+          "log_group_name": "${FlashBangLogGroup}",
+          "log_stream_name": "{instance_id}/ssh-honeypot",
+          "timezone": "UTC"
+          },
+          {
+          "file_path": "/opt/flashbang/logs/ftp.log",
+          "log_group_name": "${FlashBangLogGroup}",
+          "log_stream_name": "{instance_id}/ftp-honeypot",
+          "timezone": "UTC"
+          },
+          {
+          "file_path": "/opt/flashbang/logs/telnet.log",
+          "log_group_name": "${FlashBangLogGroup}",
+          "log_stream_name": "{instance_id}/telnet-honeypot",
+          "timezone": "UTC"
+          },
+          {
+          "file_path": "/opt/flashbang/logs/web_attacks.log",
+          "log_group_name": "${FlashBangLogGroup}",
+          "log_stream_name": "{instance_id}/web-attacks",
+          "timezone": "UTC"
+          },
+          {
+          "file_path": "/var/log/nginx/flashbang_access.log",
+          "log_group_name": "${FlashBangLogGroup}",
+          "log_stream_name": "{instance_id}/nginx-access",
+          "timezone": "UTC"
+          },
+          {
+          "file_path": "/var/log/nginx/flashbang_attacks.log",
+          "log_group_name": "${FlashBangLogGroup}",
+          "log_stream_name": "{instance_id}/nginx-attacks",
+          "timezone": "UTC"
+          }
+          ]
+          }
+          }
+          },
+          "metrics": {
+          "namespace": "FlashBang/Honeypot",
+          "metrics_collected": {
+          "cpu": {
+          "measurement": ["cpu_usage_idle", "cpu_usage_iowait", "cpu_usage_user", "cpu_usage_system"],
+          "metrics_collection_interval": 60
+          },
+          "disk": {
+          "measurement": ["used_percent"],
+          "metrics_collection_interval": 60,
+          "resources": ["*"]
+          },
+          "mem": {
+          "measurement": ["mem_used_percent"],
+          "metrics_collection_interval": 60
+          },
+          "netstat": {
+          "measurement": ["tcp_established", "tcp_time_wait"],
+          "metrics_collection_interval": 60
+          }
+          }
+          }
+          }
+          EOFCWAGENT
+
+          # Create backup script
+          cat > /opt/flashbang/scripts/backup_logs.sh << 'EOFBACKUP'
+          #!/bin/bash
+          # FlashBang log backup script
+
+          DATE=$(date +%Y-%m-%d)
+          BACKUP_DIR="/opt/flashbang/backup"
+          S3_BUCKET="${FlashBangLogsBucket}"
+
+          echo "Starting FlashBang backup for $DATE"
+
+          mkdir -p $BACKUP_DIR
+
+          # Archive logs
+          echo "Archiving logs..."
+          tar -czf $BACKUP_DIR/flashbang-logs-$DATE.tar.gz \
+          /opt/flashbang/logs/*.log \
+          /var/log/nginx/flashbang_*.log \
+          2>/dev/null || echo "Some log files may not exist yet"
+
+          # Upload to S3 if bucket exists
+          if [ ! -z "$S3_BUCKET" ]; then
+          echo "Uploading to S3..."
+          aws s3 cp $BACKUP_DIR/flashbang-logs-$DATE.tar.gz s3://$S3_BUCKET/backups/ || echo "S3 upload failed"
+          fi
+
+          # Clean up old local backups (keep 7 days)
+          echo "Cleaning up old backups..."
+          find $BACKUP_DIR -name "*.tar.gz" -mtime +7 -delete
+
+          # Export database if it exists
+          if [ -f /opt/flashbang/flashbang_attacks.db ]; then
+          echo "Backing up database..."
+          sqlite3 /opt/flashbang/flashbang_attacks.db ".backup $BACKUP_DIR/flashbang-db-$DATE.sqlite"
+          if [ ! -z "$S3_BUCKET" ]; then
+          aws s3 cp $BACKUP_DIR/flashbang-db-$DATE.sqlite s3://$S3_BUCKET/database-backups/ || echo "Database S3 upload failed"
+          fi
+          fi
+
+          echo "FlashBang backup completed for $DATE"
+          EOFBACKUP
+
+          chmod +x /opt/flashbang/scripts/backup_logs.sh
+
+          # Create monitoring script
+          cat > /opt/flashbang/scripts/health_check.sh << 'EOFHEALTH'
+          #!/bin/bash
+          # FlashBang health monitoring script
+
+          SERVICES=("flashbang-flask" "flashbang-interactive" "flashbang-web" "nginx")
+          ALL_HEALTHY=true
+          TIMESTAMP=$(date)
+
+          echo "FlashBang Health Check - $TIMESTAMP"
+          echo "================================"
+
+          # Check services
+          for service in "${SERVICES[@]}"; do
+          if systemctl is-active --quiet $service; then
+          echo "✓ $service: Running"
+          else
+          echo "✗ $service: NOT Running"
+          ALL_HEALTHY=false
+          # Attempt restart
+          echo "  → Attempting to restart $service..."
+          systemctl restart $service
+          sleep 5
+          if systemctl is-active --quiet $service; then
+          echo "  → $service: Restarted successfully"
+          else
+          echo "  → $service: Failed to restart"
+          fi
+          fi
+          done
+
+          # Check port availability
+          PORTS=(80 2222 21 23 5000 8080)
+          echo ""
+          echo "Port Status:"
+          for port in "${PORTS[@]}"; do
+          if netstat -tlnp | grep -q ":$port "; then
+          echo "✓ Port $port: Open"
+          else
+          echo "✗ Port $port: Closed"
+          ALL_HEALTHY=false
+          fi
+          done
+
+          # Check disk space
+          echo ""
+          echo "System Resources:"
+          DISK_USAGE=$(df /opt/flashbang | awk 'NR==2 {print $5}' | sed 's/%//')
+          if [ $DISK_USAGE -gt 85 ]; then
+          echo "⚠ Disk usage: $DISK_USAGE% (HIGH)"
+          ALL_HEALTHY=false
+          else
+          echo "✓ Disk usage: $DISK_USAGE%"
+          fi
+
+          # Check memory usage
+          MEM_USAGE=$(free | grep Mem | awk '{printf("%.0f", $3/$2 * 100.0)}')
+          if [ $MEM_USAGE -gt 90 ]; then
+          echo "⚠ Memory usage: $MEM_USAGE% (HIGH)"
+          ALL_HEALTHY=false
+          else
+          echo "✓ Memory usage: $MEM_USAGE%"
+          fi
+
+          # Check recent attack activity
+          echo ""
+          echo "Recent Activity:"
+          if [ -f /opt/flashbang/logs/attacks.log ]; then
+          RECENT_ATTACKS=$(tail -100 /opt/flashbang/logs/attacks.log | wc -l)
+          echo "✓ Recent attack logs: $RECENT_ATTACKS entries"
+          else
+          echo "ℹ No attack logs found yet"
+          fi
+
+          echo ""
+          if [ "$ALL_HEALTHY" = true ]; then
+          echo "✅ All systems healthy"
+          exit 0
+          else
+          echo "❌ Some issues detected"
+          exit 1
+          fi
+          EOFHEALTH
+
+          chmod +x /opt/flashbang/scripts/health_check.sh
+
+          # Create log upload script for real-time S3 sync
+          cat > /opt/flashbang/scripts/sync_logs.sh << 'EOFSYNC'
+          #!/bin/bash
+          # Real-time log sync to S3
+
+          S3_BUCKET="${FlashBangLogsBucket}"
+
+          if [ ! -z "$S3_BUCKET" ]; then
+          # Sync logs to S3 (only new/modified files)
+          aws s3 sync /opt/flashbang/logs/ s3://$S3_BUCKET/logs/ --exclude "*.tmp" --exclude "backup/*"
+          aws s3 sync /var/log/nginx/ s3://$S3_BUCKET/nginx-logs/ --include "flashbang_*"
+          fi
+          EOFSYNC
+
+          chmod +x /opt/flashbang/scripts/sync_logs.sh
+
+          # Set up cron jobs
+          echo "Setting up cron jobs..."
+
+          # Add to crontab for ec2-user
+          (crontab -u ec2-user -l 2>/dev/null; echo "# FlashBang automated tasks") | crontab -u ec2-user -
+          (crontab -u ec2-user -l 2>/dev/null; echo "0 2 * * * /opt/flashbang/scripts/backup_logs.sh >> /opt/flashbang/logs/backup.log 2>&1") | crontab -u ec2-user -
+          (crontab -u ec2-user -l 2>/dev/null; echo "*/5 * * * * /opt/flashbang/scripts/health_check.sh >> /opt/flashbang/logs/health.log 2>&1") | crontab -u ec2-user -
+          (crontab -u ec2-user -l 2>/dev/null; echo "*/15 * * * * /opt/flashbang/scripts/sync_logs.sh >> /opt/flashbang/logs/sync.log 2>&1") | crontab -u ec2-user -
+
+          # Create fail2ban configuration for additional protection
+          cat > /etc/fail2ban/jail.d/flashbang.conf << 'EOFFAIL2BAN'
+          [flashbang-http]
+          enabled = true
+          port = http,https
+          filter = flashbang-http
+          logpath = /var/log/nginx/flashbang_access.log
+          maxretry = 20
+          findtime = 300
+          bantime = 3600
+
+          [flashbang-ssh]
+          enabled = true
+          port = ssh
+          filter = sshd
+          logpath = /var/log/secure
+          maxretry = 3
+          findtime = 300
+          bantime = 3600
+          EOFFAIL2BAN
+
+          # Create custom fail2ban filter
+          cat > /etc/fail2ban/filter.d/flashbang-http.conf << 'EOFFILTER'
+          [Definition]
+          failregex = ^<HOST> -.*"(GET|POST|HEAD).*" (404|403|400|401) .*$
+          ignoreregex =
+          EOFFILTER
+
+          # Enable fail2ban
+          systemctl enable fail2ban
+          systemctl start fail2ban
+
+          # Reload systemd and enable services
+          echo "Enabling FlashBang services..."
+          systemctl daemon-reload
+          systemctl enable flashbang-flask flashbang-interactive flashbang-web
+          systemctl restart nginx
+
+          # Start CloudWatch agent
+          echo "Starting CloudWatch agent..."
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+          -a fetch-config \
+          -m ec2 \
+          -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json \
+          -s
+
+          # Wait for network to be ready, then start FlashBang services
+          echo "Starting FlashBang services..."
+          sleep 30
+          systemctl start flashbang-flask
+          sleep 10
+          systemctl start flashbang-interactive
+          sleep 10
+          systemctl start flashbang-web
+
+          # Final health check
+          echo "Running final health check..."
+          sleep 15
+          /opt/flashbang/scripts/health_check.sh
+
+          # Log successful deployment
+          echo "FlashBang honeypot deployment completed at $(date)" | tee -a /opt/flashbang/logs/deployment.log
+          
+          # Send success notification to Slack if configured
+          if [ ! -z "${SlackWebhookURL}" ]; then
+          echo "Sending deployment notification..."
+          curl -X POST -H 'Content-type: application/json' \
+          --data '{"text":"🎯 FlashBang honeypot successfully deployed and running! Instance: '"$(curl -s http://169.254.169.254/latest/meta-data/instance-id)"'"}' \
+          ${SlackWebhookURL} || echo "Slack notification failed"
+          fi
+          
+          echo "FlashBang setup complete!"
+          
+          # End of UserData script
+
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-flashbang-honeypot"
+        - Key: Purpose
+          Value: FlashBang-Honeypot
+        - Key: Environment
+          Value: Production
+  # Lambda IAM Role for Log Processing
+  LogProcessorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-log-processor-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: FlashBangLogProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: 
+                  - !Sub "${FlashBangLogsBucket}/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource: 
+                  - !GetAtt AttackAnalyticsTable.Arn
+                  - !Sub "${AttackAnalyticsTable.Arn}/index/*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If [CreateSNSTopic, !Ref FlashBangAlerts, !Ref "AWS::NoValue"]
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+
+  # Enhanced Lambda for FlashBang Log Processing
+  FlashBangLogProcessorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-flashbang-processor"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LogProcessorLambdaRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !If [CreateSNSTopic, !Ref FlashBangAlerts, ""]
+          SLACK_WEBHOOK: !If [EnableSlack, !Ref SlackWebhookURL, ""]
+          DYNAMODB_TABLE: !Ref AttackAnalyticsTable
+          ENABLE_THREAT_INTEL: !Ref EnableThreatIntel
+          ABUSEIPDB_KEY: !Ref AbuseIPDBKey
+          VIRUSTOTAL_API_KEY: !Ref VirusTotalAPIKey
+          HONEYPOT_MODE: !Ref HoneypotMode
+          FLASHBANG_MODE: "true"
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import gzip
+          import base64
+          import os
+          import re
+          import requests
+          from collections import defaultdict, Counter
+          from datetime import datetime, timedelta
+          from urllib.parse import unquote
+
+          # Initialize AWS clients
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
+
+          def lambda_handler(event, context):
+              """Enhanced FlashBang log processor"""
+              try:
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = record['s3']['object']['key']
+                      
+                      # Download and process log file
+                      response = s3.get_object(Bucket=bucket, Key=key)
+                      
+                      if key.endswith('.gz'):
+                          content = gzip.decompress(response['Body'].read()).decode('utf-8')
+                      else:
+                          content = response['Body'].read().decode('utf-8')
+                      
+                      # Determine log type and process accordingly
+                      if 'nginx' in key:
+                          report = analyze_nginx_logs(content)
+                      elif 'flashbang' in key or 'attacks' in key:
+                          report = analyze_flashbang_logs(content)
+                      else:
+                          report = analyze_generic_logs(content)
+                      
+                      # Store analytics and send alerts
+                      store_flashbang_analytics(report)
+                      
+                      if should_alert_flashbang(report):
+                          send_flashbang_alerts(report)
+                      
+                  return {'statusCode': 200, 'body': 'FlashBang log processing complete'}
+              except Exception as e:
+                  print(f"FlashBang processor error: {str(e)}")
+                  return {'statusCode': 500, 'body': f'Error: {str(e)}'}
+
+          def analyze_flashbang_logs(content):
+              """Analyze FlashBang-specific attack logs"""
+              lines = content.strip().split('\n')
+              
+              # FlashBang-specific patterns
+              flashbang_patterns = {
+                  'rickroll_triggered': r'rickroll.*triggered',
+                  'fake_shell_access': r'shell.*access.*attempt',
+                  'honeypot_interaction': r'honeypot.*interaction',
+                  'deception_triggered': r'deception.*engine.*triggered',
+                  'threat_intel_hit': r'threat.*intelligence.*match'
+              }
+              
+              attack_summary = {
+                  'total_interactions': 0,
+                  'unique_ips': set(),
+                  'flashbang_specific': Counter(),
+                  'attack_types': Counter(),
+                  'high_risk_ips': set(),
+                  'deception_effectiveness': 0,
+                  'timestamp': datetime.now().isoformat()
+              }
+              
+              for line in lines:
+                  if not line.strip():
+                      continue
+                      
+                  attack_summary['total_interactions'] += 1
+                  
+                  # Extract IP
+                  ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
+                  if ip_match:
+                      ip = ip_match.group(1)
+                      attack_summary['unique_ips'].add(ip)
+                  
+                  # Check FlashBang-specific patterns
+                  line_lower = line.lower()
+                  for pattern_name, pattern in flashbang_patterns.items():
+                      if re.search(pattern, line_lower):
+                          attack_summary['flashbang_specific'][pattern_name] += 1
+                          if pattern_name in ['threat_intel_hit', 'deception_triggered']:
+                              attack_summary['deception_effectiveness'] += 1
+                          break
+                  
+                  # Traditional attack pattern detection
+                  if re.search(r'sql.*injection|union.*select|drop.*table', line_lower):
+                      attack_summary['attack_types']['sql_injection'] += 1
+                      if ip_match:
+                          attack_summary['high_risk_ips'].add(ip_match.group(1))
+                  
+                  if re.search(r'<script|javascript:|xss', line_lower):
+                      attack_summary['attack_types']['xss'] += 1
+                  
+                  if re.search(r'cmd.*exec|shell.*injection', line_lower):
+                      attack_summary['attack_types']['command_injection'] += 1
+                      if ip_match:
+                          attack_summary['high_risk_ips'].add(ip_match.group(1))
+              
+              # Convert sets to lists for JSON serialization
+              attack_summary['unique_ips'] = list(attack_summary['unique_ips'])
+              attack_summary['high_risk_ips'] = list(attack_summary['high_risk_ips'])
+              attack_summary['flashbang_specific'] = dict(attack_summary['flashbang_specific'])
+              attack_summary['attack_types'] = dict(attack_summary['attack_types'])
+              
+              return attack_summary
+
+          def analyze_nginx_logs(content):
+              """Analyze Nginx access logs for FlashBang"""
+              lines = content.strip().split('\n')
+              
+              summary = {
+                  'total_requests': 0,
+                  'unique_ips': set(),
+                  'status_codes': Counter(),
+                  'user_agents': Counter(),
+                  'top_endpoints': Counter(),
+                  'suspicious_requests': 0,
+                  'timestamp': datetime.now().isoformat()
+              }
+              
+              for line in lines:
+                  if not line.strip():
+                      continue
+                      
+                  summary['total_requests'] += 1
+                  
+                  # Parse Nginx log format: IP - - [timestamp] "request" status size "referer" "user-agent"
+                  parts = line.split(' ')
+                  if len(parts) >= 7:
+                      ip = parts[0]
+                      status_code = parts[6] if parts[6] != '-' else '000'
+                      
+                      summary['unique_ips'].add(ip)
+                      summary['status_codes'][status_code] += 1
+                      
+                      # Extract request from quotes
+                      if '"' in line:
+                          request_match = re.search(r'"([^"]+)"', line)
+                          if request_match:
+                                        request_str = request_match.group(1)
+                                        method_and_endpoint = request_str.split(' ')
+                                        if len(method_and_endpoint) > 1:
+                                            endpoint = method_and_endpoint[1]
+                                            summary['top_endpoints'][endpoint] += 1
+                                            
+                                            # Check for suspicious patterns in endpoint
+                                            suspicious_patterns = [
+                                                r'\.env', r'\.git', r'admin', r'wp-', r'sql', 
+                                                r'script', r'union', r'select', r'<script', r'javascript:',
+                                                r'cmd', r'exec', r'system', r'eval'
+                                            ]
+                                            
+                                            endpoint_lower = endpoint.lower()
+                                            for pattern in suspicious_patterns:
+                                                if re.search(pattern, endpoint_lower):
+                                                    summary['suspicious_requests'] += 1
+                                                    break
+                      
+                      # Extract user agent (last quoted string)
+                      ua_matches = re.findall(r'"([^"]*)"', line)
+                      if len(ua_matches) >= 2:  # Usually referer and user-agent
+                          user_agent = ua_matches[-1]  # Last one is typically user-agent
+                          if user_agent and user_agent != '-':
+                                        summary['user_agents'][user_agent] += 1
+              
+              # Convert sets to lists for JSON serialization
+              summary['unique_ips'] = list(summary['unique_ips'])
+              summary['status_codes'] = dict(summary['status_codes'])
+              summary['user_agents'] = dict(summary['user_agents'].most_common(10))
+              summary['top_endpoints'] = dict(summary['top_endpoints'].most_common(20))
+              
+              return summary
+
+          def analyze_generic_logs(content):
+              """Fallback for other log types"""
+              lines = content.strip().split('\n')
+              
+              return {
+                  'total_lines': len([line for line in lines if line.strip()]),
+                  'contains_attacks': len([line for line in lines if 'attack' in line.lower()]),
+                  'timestamp': datetime.now().isoformat(),
+                  'log_type': 'generic'
+              }
+
+          def store_flashbang_analytics(report):
+              """Store FlashBang analytics in DynamoDB"""
+              try:
+                  # Store summary record
+                  summary_item = {
+                      'ip_address': 'SUMMARY',
+                      'timestamp': report['timestamp'],
+                      'total_interactions': report.get('total_interactions', 0),
+                      'unique_ips_count': len(report.get('unique_ips', [])),
+                      'ttl': int((datetime.now() + timedelta(days=90)).timestamp())
+                  }
+                  
+                  # Add FlashBang-specific data if present
+                  if 'flashbang_specific' in report:
+                      summary_item['flashbang_patterns'] = json.dumps(report['flashbang_specific'])
+                  if 'attack_types' in report:
+                      summary_item['attack_types'] = json.dumps(report['attack_types'])
+                  if 'deception_effectiveness' in report:
+                      summary_item['deception_effectiveness'] = report['deception_effectiveness']
+                  
+                  table.put_item(Item=summary_item)
+                  
+                  # Store individual high-risk IPs (limit to prevent throttling)
+                  high_risk_ips = report.get('high_risk_ips', [])
+                  for ip_addr in high_risk_ips[:10]: # Renamed ip to ip_addr to avoid conflict
+                      table.put_item(
+                          Item={
+                                        'ip_address': ip_addr,
+                                        'timestamp': report['timestamp'],
+                                        'risk_level': 'HIGH',
+                                        'flagged_by': 'FlashBang',
+                                        'attack_count': report.get('total_interactions', 0), # Example, might need adjustment
+                                        'ttl': int((datetime.now() + timedelta(days=90)).timestamp())
+                          }
+                      )
+                      
+              except Exception as e:
+                  print(f"Failed to store FlashBang analytics: {e}")
+
+          def should_alert_flashbang(report):
+              """Determine if FlashBang should send alerts"""
+              # High interaction count
+              if report.get('total_interactions', 0) > 500:
+                  return True
+              
+              # High number of requests (for nginx logs)
+              if report.get('total_requests', 0) > 1000:
+                  return True
+              
+              # Multiple high-risk IPs
+              if len(report.get('high_risk_ips', [])) > 3:
+                  return True
+              
+              # High suspicious request rate
+              total_requests = report.get('total_requests', 0)
+              suspicious_requests = report.get('suspicious_requests', 0)
+              if total_requests > 0 and (suspicious_requests / total_requests) > 0.5:
+                  return True
+              
+              # Effective deception (attackers are being fooled)
+              if report.get('deception_effectiveness', 0) > 10:
+                  return True
+              
+              # Specific FlashBang patterns triggered
+              flashbang_patterns = report.get('flashbang_specific', {})
+              if flashbang_patterns.get('threat_intel_hit', 0) > 5:
+                  return True
+              
+              return False
+
+          def send_flashbang_alerts(report):
+              """Send FlashBang-specific alerts"""
+              message_content = format_flashbang_alert(report) # Renamed message to message_content
+              
+              # Send SNS alert
+              sns_topic_arn = os.environ.get('SNS_TOPIC_ARN') # Renamed sns_topic
+              if sns_topic_arn:
+                  try:
+                      subject_line = f"🎯 FlashBang Alert - {report.get('total_interactions', report.get('total_requests', 0))} interactions" # Renamed subject
+                      sns.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject=subject_line,
+                          Message=message_content
+                      )
+                  except Exception as e:
+                      print(f"Failed to send SNS alert: {e}")
+              
+              # Send Slack alert
+              slack_webhook_url = os.environ.get('SLACK_WEBHOOK') # Renamed slack_webhook
+              if slack_webhook_url:
+                  try:
+                      slack_payload_data = format_flashbang_slack_alert(report) # Renamed slack_payload
+                      requests.post(slack_webhook_url, json=slack_payload_data, timeout=10)
+                  except Exception as e:
+                      print(f"Failed to send Slack alert: {e}")
+
+          def format_flashbang_alert(report):
+              """Format FlashBang alert message"""
+              total_activity = report.get('total_interactions', report.get('total_requests', 0))
+              
+              msg = f"""
+          🎯 FlashBang Honeypot Activity Report
+          
+          📊 Activity Summary:
+          • Total Activity: {total_activity:,}
+          • Unique IPs: {len(report.get('unique_ips', [])):,}
+          • High-Risk IPs: {len(report.get('high_risk_ips', [])):,}
+          """
+              
+              # Add FlashBang-specific patterns if available
+              if 'flashbang_specific' in report:
+                  msg += "• Deception Effectiveness: {}\n".format(report.get('deception_effectiveness', 0))
+                  msg += "\n🎪 FlashBang-Specific Detections:\n"
+                  for pattern, count in report['flashbang_specific'].items():
+                      if count > 0:
+                          msg += f"• {pattern.replace('_', ' ').title()}: {count:,}\n"
+              
+              # Add attack types
+              if 'attack_types' in report:
+                  msg += "\n🎯 Attack Types:\n"
+                  for attack_type, count in report['attack_types'].items():
+                      if count > 0:
+                          msg += f"• {attack_type.replace('_', ' ').title()}: {count:,}\n"
+              
+              # Add suspicious requests for nginx logs
+              if 'suspicious_requests' in report and report['suspicious_requests'] > 0:
+                  msg += f"\n⚠️ Suspicious Requests: {report['suspicious_requests']:,}\n"
+              
+              # Add top endpoints if available
+              if 'top_endpoints' in report:
+                  msg += "\n🔥 Top Targeted Endpoints:\n"
+                  for endpoint, count in list(report['top_endpoints'].items())[:5]:
+                      msg += f"• {endpoint}: {count:,}\n"
+              
+              # Add high-risk IPs
+              if report.get('high_risk_ips'):
+                  msg += f"\n🚨 High-Risk IPs:\n"
+                  for ip_address in report['high_risk_ips'][:5]: # Renamed ip to ip_address
+                      msg += f"• {ip_address}\n"
+              
+              msg += f"\n⏰ Report Generated: {report.get('timestamp', 'Unknown')}"
+              
+              return msg
+
+          def format_flashbang_slack_alert(report):
+              """Format FlashBang Slack alert with rich formatting"""
+              total_activity = report.get('total_interactions', report.get('total_requests', 0))
+              high_risk_count = len(report.get('high_risk_ips', []))
+              effectiveness = report.get('deception_effectiveness', 0)
+              
+              # Choose emoji based on activity level
+              if effectiveness > 20:
+                  effectiveness_emoji = "🎯"
+                  color_hex = "good" # Renamed color to color_hex
+              elif effectiveness > 10:
+                  effectiveness_emoji = "🎪"
+                  color_hex = "warning"
+              elif high_risk_count > 10:
+                  effectiveness_emoji = "🚨"
+                  color_hex = "danger"
+              else:
+                  effectiveness_emoji = "🎭"
+                  color_hex = "good"
+              
+              field_list = [ # Renamed fields to field_list
+                  {
+                      "title": "Total Activity",
+                      "value": f"{total_activity:,}",
+                      "short": True
+                  },
+                  {
+                      "title": "Unique IPs",
+                      "value": f"{len(report.get('unique_ips', [])):,}",
+                      "short": True
+                  },
+                  {
+                      "title": "High-Risk IPs",
+                      "value": f"{high_risk_count}",
+                      "short": True
+                  }
+              ]
+              
+              # Add deception effectiveness if available
+              if effectiveness > 0:
+                  field_list.append({
+                      "title": "Deception Success",
+                      "value": f"{effectiveness} fooled attackers",
+                      "short": True
+                  })
+              
+              return {
+                  "text": f"🎯 FlashBang captured {total_activity:,} interactions from {len(report.get('unique_ips', [])):,} unique IPs",
+                  "attachments": [
+                      {
+                          "color": color_hex,
+                          "title": f"{effectiveness_emoji} FlashBang Honeypot Activity",
+                          "fields": field_list,
+                          "footer": "FlashBang Honeypot System",
+                          "ts": int(datetime.now().timestamp())
+                      }
+                  ]
+              }
+
+  # Lambda Permission for S3 to invoke the function
+  LogProcessorLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FlashBangLogProcessorLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "${FlashBangLogsBucket}/*"
+
+  # Custom Metrics Lambda for FlashBang
+  FlashBangMetricsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-flashbang-metrics"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt MetricsLambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref FlashBangInstance
+          LOG_GROUP: !Ref FlashBangLogGroup
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime, timedelta
+          import time # Added import time
+
+          cloudwatch = boto3.client('cloudwatch')
+          logs_client = boto3.client('logs') # Renamed logs to logs_client
+
+          def lambda_handler(event, context):
+              """Publish custom FlashBang metrics"""
+              try:
+                  # Get log insights data
+                  end_time = datetime.now()
+                  start_time = end_time - timedelta(minutes=15)
+                  
+                  # Query for deception effectiveness
+                  query_string = """
+                  fields @timestamp, @message
+                  | filter @message like /deception.*triggered/
+                  | stats count() as deception_count
+                  """ # Renamed query to query_string
+                  
+                  response_query = logs_client.start_query( # Renamed response
+                      logGroupName=os.environ['LOG_GROUP'],
+                      startTime=int(start_time.timestamp()),
+                      endTime=int(end_time.timestamp()),
+                      queryString=query_string
+                  )
+                  
+                  # Wait for query to complete and get results
+                  time.sleep(5) # Explicitly use time.sleep
+                  
+                  query_results = logs_client.get_query_results(queryId=response_query['queryId']) # Renamed results
+                  
+                  deception_count_val = 0 # Renamed deception_count
+                  if query_results['results']:
+                      for result_item in query_results['results']: # Renamed result to result_item
+                          if result_item[0]['field'] == 'deception_count':
+                                        deception_count_val = int(result_item[0]['value'])
+                                        break
+                  
+                  # Publish custom metric
+                  cloudwatch.put_metric_data(
+                      Namespace='FlashBang/Honeypot',
+                      MetricData=[
+                          {
+                                        'MetricName': 'DeceptionEffectiveness',
+                                        'Value': deception_count_val,
+                                        'Unit': 'Count',
+                                        'Dimensions': [
+                                            {
+                                                'Name': 'InstanceId',
+                                                'Value': os.environ['INSTANCE_ID']
+                                            }
+                                        ]
+                          }
+                      ]
+                  )
+                  
+                  return {'statusCode': 200, 'body': f'Published deception metric: {deception_count_val}'}
+              except Exception as e:
+                  print(f"Error publishing metrics: {e}")
+                  return {'statusCode': 500, 'body': str(e)}
+
+  MetricsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: FlashBangMetricsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:StartQuery
+                  - logs:GetQueryResults
+                  - logs:DescribeLogGroups
+                Resource: !GetAtt FlashBangLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+
+  # Schedule for Metrics Collection
+  MetricsScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Schedule FlashBang metrics collection"
+      ScheduleExpression: "rate(15 minutes)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt FlashBangMetricsLambda.Arn
+          Id: "FlashBangMetricsTarget"
+
+  MetricsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FlashBangMetricsLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MetricsScheduleRule.Arn
+
+  # CloudWatch Alarms for FlashBang
+  FlashBangHighInteractionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-flashbang-high-interaction"
+      AlarmDescription: "High interaction rate detected on FlashBang honeypot"
+      MetricName: RequestCount
+      Namespace: AWS/ApplicationELB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 500
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt HoneypotALB.LoadBalancerFullName
+      AlarmActions:
+        - !If [CreateSNSTopic, !Ref FlashBangAlerts, !Ref "AWS::NoValue"]
+
+  FlashBangDeceptionEffectivenessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-flashbang-deception-effective"
+      AlarmDescription: "FlashBang deception tactics are working effectively"
+      MetricName: DeceptionEffectiveness
+      Namespace: FlashBang/Honeypot
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If [CreateSNSTopic, !Ref FlashBangAlerts, !Ref "AWS::NoValue"]
+
+  FlashBangInstanceHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-instance-health"
+      AlarmDescription: "FlashBang instance health check"
+      MetricName: StatusCheckFailed
+      Namespace: AWS/EC2
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref FlashBangInstance
+      AlarmActions:
+        - !If [CreateSNSTopic, !Ref FlashBangAlerts, !Ref "AWS::NoValue"]
+
+  # Enhanced CloudWatch Dashboard for FlashBang
+  FlashBangDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-flashbang-dashboard"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${HoneypotALB.LoadBalancerFullName}" ],
+                  [ ".", "TargetResponseTime", ".", "." ],
+                  [ "FlashBang/Honeypot", "DeceptionEffectiveness" ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "🎯 FlashBang Activity Overview",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EC2", "CPUUtilization", "InstanceId", "${FlashBangInstance}" ],
+                  [ ".", "NetworkIn", ".", "." ],
+                  [ ".", "NetworkOut", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "🖥️ FlashBang Instance Performance",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0, "y": 6, "width": 24, "height": 8,
+              "properties": {
+                "query": "SOURCE '${FlashBangLogGroup}'\n| fields @timestamp, @message\n| filter @message like /attack|interaction|honeypot|FlashBang/\n| sort @timestamp desc\n| limit 50",
+                "region": "${AWS::Region}",
+                "title": "🎪 Recent FlashBang Interactions",
+                "view": "table"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0, "y": 14, "width": 12, "height": 6,
+              "properties": {
+                "query": "SOURCE '${FlashBangLogGroup}'\n| fields @timestamp, @message\n| filter @message like /deception.*triggered/\n| stats count() by bin(5m)",
+                "region": "${AWS::Region}",
+                "title": "🎭 Deception Effectiveness Over Time",
+                "view": "line"
+              }
+            },
+            {
+              "type": "log",
+              "x": 12, "y": 14, "width": 12, "height": 6,
+              "properties": {
+                "query": "SOURCE '${FlashBangLogGroup}'\n| parse @message /(?<ip>\\d+\\.\\d+\\.\\d+\\.\\d+)/\n| stats count() by ip\n| sort count desc\n| limit 10",
+                "region": "${AWS::Region}",
+                "title": "🔥 Top Attacking IPs",
+                "view": "table"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0, "y": 20, "width": 12, "height": 6,
+              "properties": {
+                "query": "SOURCE '${FlashBangLogGroup}'\n| fields @timestamp, @message\n| filter @message like /rickroll/\n| stats count() by bin(1h)",
+                "region": "${AWS::Region}",
+                "title": "🎵 Rickroll Triggers",
+                "view": "line"
+              }
+            },
+            {
+              "type": "log",
+              "x": 12, "y": 20, "width": 12, "height": 6,
+              "properties": {
+                "query": "SOURCE '${FlashBangLogGroup}'\n| fields @timestamp, @message\n| filter @message like /admin|wp-admin|phpmyadmin/\n| stats count() by bin(1h)",
+                "region": "${AWS::Region}",
+                "title": "🚪 Admin Panel Attempts",
+                "view": "line"
+              }
+            }
+          ]
+        }
+
+  # WAF Web ACL (Optional)
+  FlashBangWebACL:
+    Type: AWS::WAFv2::WebACL
+    Condition: EnableWAF
+    Properties:
+      Name: !Sub "${AWS::StackName}-flashbang-waf"
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      Rules:
+        # Rate limiting rule - allow high traffic for honeypot
+        - Name: RateLimitRule
+          Priority: 1
+          Statement:
+            RateBasedStatement:
+              Limit: 5000  # Higher limit for honeypot
+              AggregateKeyType: IP
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: FlashBangRateLimit
+        # AWS Managed Rules - Common Rule Set
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 2
+          OverrideAction:
+            Count: {}  # Count instead of block for honeypot analysis
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              ExcludedRules:
+                - Name: GenericRFI_BODY
+                - Name: GenericRFI_QUERYARGUMENTS
+                - Name: GenericRFI_URIPATH
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: FlashBangCommonRules
+        # AWS Managed Rules - Known Bad Inputs
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 3
+          OverrideAction:
+            Count: {}  # Count for analysis
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: FlashBangBadInputs
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${AWS::StackName}FlashBangWebACL"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-flashbang-waf"
+        - Key: Purpose
+          Value: FlashBang-WAF
+
+  # Associate WAF with ALB
+  FlashBangWebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: EnableWAF
+    Properties:
+      ResourceArn: !Ref HoneypotALB
+      WebACLArn: !GetAtt FlashBangWebACL.Arn
+
+  # S3 Bucket Policy for Lambda Access
+  FlashBangLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FlashBangLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLambdaAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt LogProcessorLambdaRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: !Sub "${FlashBangLogsBucket}/*"
+          - Sid: AllowInstanceAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt FlashBangInstanceRole.Arn
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:ListBucket
+            Resource: 
+              - !Sub "${FlashBangLogsBucket}/*"
+              - !GetAtt FlashBangLogsBucket.Arn
+
+# OUTPUTS SECTION
+Outputs:
+  FlashBangURL:
+    Description: FlashBang honeypot URL (via Application Load Balancer)
+    Value: !Sub "http://${HoneypotALB.DNSName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-flashbang-url"
+
+  FlashBangHTTPSURL:
+    Condition: EnableHTTPS
+    Description: FlashBang honeypot HTTPS URL
+    Value: !Sub "https://${DomainName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-flashbang-https-url"
+
+  FlashBangInstanceId:
+    Description: EC2 Instance ID of the FlashBang honeypot
+    Value: !Ref FlashBangInstance
+    Export:
+      Name: !Sub "${AWS::StackName}-instance-id"
+
+  FlashBangInstancePrivateIP:
+    Description: Private IP address of FlashBang instance
+    Value: !GetAtt FlashBangInstance.PrivateIp
+    Export:
+      Name: !Sub "${AWS::StackName}-private-ip"
+
+  FlashBangSSHCommand:
+    Description: SSH command to access FlashBang instance
+    Value: !Sub "ssh -i your-key.pem ec2-user@${FlashBangInstance.PrivateIp}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ssh-command"
+
+  FlashBangLogsBucket:
+    Description: S3 bucket for FlashBang logs and backups
+    Value: !Ref FlashBangLogsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-logs-bucket"
+
+  FlashBangDashboardURL:
+    Description: CloudWatch Dashboard for FlashBang monitoring
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-flashbang-dashboard"
+
+  FlashBangLogsCommand:
+    Description: AWS CLI command to view FlashBang logs
+    Value: !Sub "aws logs tail ${FlashBangLogGroup} --follow --region ${AWS::Region}"
+
+  FlashBangConfigLocation:
+    Description: Location of FlashBang configuration file on instance
+    Value: "/opt/flashbang/config.json"
+
+  FlashBangServicesStatus:
+    Description: Command to check FlashBang services status
+    Value: "sudo systemctl status flashbang-flask flashbang-interactive flashbang-web nginx"
+
+  FlashBangHealthCheck:
+    Description: Health check endpoint for monitoring
+    Value: !Sub "http://${HoneypotALB.DNSName}/health-check-fake-endpoint"
+
+  FlashBangInteractiveServices:
+    Description: Interactive honeypot services and ports
+    Value: "SSH (2222), FTP (21), Telnet (23), MySQL (3306), Redis (6379), RDP (3389), SMB (445)"
+
+  FlashBangLogLocations:
+    Description: Key log file locations on the instance
+    Value: |
+      Main logs: /opt/flashbang/logs/
+      Nginx logs: /var/log/nginx/flashbang_*.log
+      System logs: journalctl -u flashbang-*
+      Health logs: /opt/flashbang/logs/health.log
+
+  FlashBangThreatIntelStatus:
+    Condition: EnableThreatIntel
+    Description: Threat intelligence integration status
+    Value: "Enabled with AbuseIPDB and VirusTotal"
+
+  FlashBangWAFStatus:
+    Condition: EnableWAF
+    Description: AWS WAF protection status
+    Value: !Sub "Enabled - WebACL: ${FlashBangWebACL}"
+
+  FlashBangSlackIntegration:
+    Condition: EnableSlack
+    Description: Slack integration status
+    Value: "Enabled - Real-time alerts configured"
+
+  FlashBangMode:
+    Description: Current FlashBang interaction mode
+    Value: !Ref HoneypotMode
+
+  FlashBangDeploymentGuide:
+    Description: Quick deployment verification steps
+    Value: |
+      1. Check instance: aws ec2 describe-instances --instance-ids INSTANCE_ID
+      2. Verify services: ssh to instance and run 'sudo systemctl status flashbang-*'
+      3. Test honeypot: curl http://ALB_DNS_NAME/
+      4. Monitor dashboard: Check CloudWatch Dashboard URL
+      5. Review logs: aws logs tail LOG_GROUP_NAME --follow
+
+  FlashBangSecurityNote:
+    Description: Important security reminder
+    Value: |
+      ⚠️  SECURITY REMINDER:
+      - This honeypot is intentionally vulnerable for research purposes
+      - Monitor all activity and maintain proper isolation
+      - Regularly review and analyze captured attack data
+      - Ensure compliance with your organization's security policies
+      - Keep the underlying system updated and secured
+
+  FlashBangSupport:
+    Description: Support and troubleshooting resources
+    Value: |
+      📚 Resources:
+      - Health check: /opt/flashbang/scripts/health_check.sh
+      - Log backup: /opt/flashbang/scripts/backup_logs.sh  
+      - Service restart: sudo systemctl restart flashbang-*
+      - View real-time attacks: tail -f /opt/flashbang/logs/attacks.log
+      - CloudWatch Logs: Use the FlashBangLogsCommand output
+
