@@ -792,13 +792,3 @@ Outputs:
   SecurityWarning:
     Description: Important security notice
     Value: "⚠️ This honeypot is intentionally vulnerable. Monitor carefully, ensure proper network isolation, and comply with applicable laws and regulations."
-
-  DeploymentNotes:
-    Description: Post-deployment instructions
-    Value: |
-      1. Wait 5-10 minutes for full deployment
-      2. Test the web interface at the provided URL
-      3. Monitor logs for attack attempts
-      4. Use health check script to verify all services
-      5. Configure firewall rules as needed for your environment
-```
