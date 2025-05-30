@@ -738,4 +738,67 @@ Resources:
 Outputs:
   FlashBangURL:
     Description: FlashBang Honeypot Web Interface
-    Value: !Sub http
+    Value: !Sub http://${FlashBangInstance.PublicIp}
+    Export:
+      Name: !Sub ${AWS::StackName}-honeypot-url
+
+  FlashBangPublicIP:
+    Description: Public IP address of FlashBang instance
+    Value: !Ref FlashBangInstance.PublicIp
+    Export:
+      Name: !Sub ${AWS::StackName}-public-ip
+
+  SSMSessionCommand:
+    Description: Connect via AWS Systems Manager (no SSH key needed, works from any IP)
+    Value: !Sub aws ssm start-session --target ${FlashBangInstance} --region ${AWS::Region}
+
+  SSHCommand:
+    Description: SSH command to access the FlashBang instance (requires IP whitelisting)
+    Value: !Sub ssh -i ${KeyName}.pem ec2-user@${FlashBangInstance.PublicIp}
+
+  HoneypotServices:
+    Description: Active honeypot services and ports
+    Value: "Web(80), SSH(2222), FTP(21), Telnet(23), MySQL(3306), PostgreSQL(5432)"
+
+  LogsLocation:
+    Description: Location of attack logs on the instance
+    Value: "/opt/flashbang/logs/"
+
+  S3LogsBucket:
+    Description: S3 bucket for log storage
+    Value: !Ref FlashBangLogsBucket
+
+  HealthCheckCommand:
+    Description: Command to check FlashBang system health
+    Value: "/opt/flashbang/scripts/health_check.sh"
+
+  MonitoringCommands:
+    Description: Commands for monitoring FlashBang activity
+    Value: |
+      Real-time attacks: tail -f /opt/flashbang/logs/attacks.log
+      SSH attempts: tail -f /opt/flashbang/logs/ssh.log  
+      FTP attempts: tail -f /opt/flashbang/logs/ftp.log
+      Telnet attempts: tail -f /opt/flashbang/logs/telnet.log
+      Service status: systemctl status flashbang-*
+
+  TestCommands:
+    Description: Commands to test the honeypot functionality
+    Value: |
+      Test web interface: curl http://INSTANCE_IP/admin
+      Test SSH honeypot: nc INSTANCE_IP 2222
+      Test FTP honeypot: nc INSTANCE_IP 21
+      Test fake files: curl http://INSTANCE_IP/.env
+
+  SecurityWarning:
+    Description: Important security notice
+    Value: "⚠️ This honeypot is intentionally vulnerable. Monitor carefully, ensure proper network isolation, and comply with applicable laws and regulations."
+
+  DeploymentNotes:
+    Description: Post-deployment instructions
+    Value: |
+      1. Wait 5-10 minutes for full deployment
+      2. Test the web interface at the provided URL
+      3. Monitor logs for attack attempts
+      4. Use health check script to verify all services
+      5. Configure firewall rules as needed for your environment
+```
