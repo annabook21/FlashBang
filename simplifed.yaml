@@ -726,4 +726,10 @@ Resources:
           
           echo "🎯 FlashBang Honeypot deployment completed successfully at $(date)"
           echo "🌐 Access your honeypot at: http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)"
-          echo "📊 Monitor logs: tail -f /opt/flashbang/logs/attacks.log
+          echo "📊 Monitor logs: tail -f /opt/flashbang/logs/attacks.log"
+          
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-flashbang-honeypot
+        - Key: Purpose
+          Value: FlashBang-Research-Honeypot
