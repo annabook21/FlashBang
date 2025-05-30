@@ -1,0 +1,729 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'FlashBang Honeypot - Simplified Demo Version - Simulates malicious traffic and sends confusing payload responses'
+
+Parameters:
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: Latest Amazon Linux 2 AMI ID
+
+  MyIP:
+    Type: String
+    Description: Your IP address for SSH access (e.g., 203.0.113.0/32)
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    ConstraintDescription: Must be a valid CIDR notation
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 KeyPair for SSH access
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+    Description: EC2 instance type
+
+  NotificationEmail:
+    Type: String
+    Description: Email for attack notifications (optional)
+    Default: ''
+
+Conditions:
+  CreateSNSTopic: !Not [!Equals [!Ref NotificationEmail, '']]
+
+Resources:
+  # VPC and Networking
+  FlashBangVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-vpc
+
+  FlashBangIGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref FlashBangVPC
+      InternetGatewayId: !Ref FlashBangIGW
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref FlashBangVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public-subnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref FlashBangVPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref FlashBangIGW
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # S3 Bucket for Logs
+  FlashBangLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-flashbang-logs-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  # SNS Topic for Alerts
+  FlashBangAlerts:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSTopic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-alerts
+      DisplayName: FlashBang Honeypot Alerts
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  # Security Group
+  FlashBangSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${AWS::StackName}-sg
+      GroupDescription: FlashBang honeypot security group
+      VpcId: !Ref FlashBangVPC
+      SecurityGroupIngress:
+        # Admin SSH access
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MyIP
+          Description: SSH admin access
+        # HTTP/HTTPS for web honeypot
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP honeypot
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS honeypot
+        # SSH honeypot
+        - IpProtocol: tcp
+          FromPort: 2222
+          ToPort: 2222
+          CidrIp: 0.0.0.0/0
+          Description: SSH honeypot
+        # FTP honeypot
+        - IpProtocol: tcp
+          FromPort: 21
+          ToPort: 21
+          CidrIp: 0.0.0.0/0
+          Description: FTP honeypot
+        # Telnet honeypot
+        - IpProtocol: tcp
+          FromPort: 23
+          ToPort: 23
+          CidrIp: 0.0.0.0/0
+          Description: Telnet honeypot
+        # Database honeypots
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 0.0.0.0/0
+          Description: MySQL honeypot
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 0.0.0.0/0
+          Description: PostgreSQL honeypot
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+
+  # IAM Role for EC2 Instance
+  FlashBangInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-instance-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: FlashBangPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub ${FlashBangLogsBucket}/*
+                  - !GetAtt FlashBangLogsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If [CreateSNSTopic, !Ref FlashBangAlerts, !Ref AWS::NoValue]
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  FlashBangInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${AWS::StackName}-profile
+      Roles:
+        - !Ref FlashBangInstanceRole
+
+  # EC2 Instance
+  FlashBangInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref FlashBangSecurityGroup
+      IamInstanceProfile: !Ref FlashBangInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          
+          # Logging setup
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          echo "🎯 FlashBang Honeypot deployment started at $(date)"
+          
+          # System updates
+          yum update -y
+          yum install -y python3 python3-pip git nginx docker htop jq wget curl
+          
+          # Install Node.js
+          curl -sL https://rpm.nodesource.com/setup_18.x | bash -
+          yum install -y nodejs
+          
+          # Start services
+          systemctl start docker nginx
+          systemctl enable docker nginx
+          usermod -aG docker ec2-user
+          
+          # Create FlashBang directories
+          mkdir -p /opt/flashbang/{logs,data,scripts,static,templates}
+          chown -R ec2-user:ec2-user /opt/flashbang
+          
+          # Install Python dependencies
+          pip3 install flask flask-limiter boto3 requests asyncio asyncssh pyftpdlib
+          
+          # Create main Flask app with confusing responses
+          cat > /opt/flashbang/app.py << 'EOF'
+          from flask import Flask, request, render_template_string, redirect, jsonify
+          import boto3
+          import json
+          import os
+          import random
+          import time
+          from datetime import datetime
+          import logging
+          
+          app = Flask(__name__)
+          logging.basicConfig(level=logging.INFO)
+          
+          # Confusing/deceptive responses for attackers
+          CONFUSING_RESPONSES = [
+              "Access granted... initializing secure tunnel...",
+              "Connection established to mainframe...",
+              "Decrypting database... please wait...",
+              "WARNING: Intrusion detected, logging IP...",
+              "System compromised. Self-destruct in 3... 2... 1...",
+              "FBI Cyber Division monitoring this connection...",
+              "Welcome to WOPR. Shall we play a game?",
+              "Connection traced. Law enforcement notified.",
+              "Honeypot activated. Your activities are being recorded.",
+              "ERROR: Nuclear launch codes not found in this directory.",
+          ]
+          
+          FAKE_ERRORS = [
+              "mysqli_connect(): Access denied for user 'root'@'localhost'",
+              "Warning: include(/etc/passwd): failed to open stream",
+              "Fatal error: Call to undefined function shell_exec()",
+              "Error: Cannot execute binary file",
+              "Permission denied: /etc/shadow",
+              "bash: syntax error near unexpected token",
+          ]
+          
+          FAKE_SUCCESS = [
+              "Login successful. Welcome admin!",
+              "Shell access granted.",
+              "Database connected successfully.",
+              "File uploaded to /tmp/backdoor.php",
+              "Privilege escalation complete.",
+              "Root access obtained.",
+          ]
+          
+          def log_attack(endpoint, ip, user_agent, headers, response_type="normal"):
+              """Log attack attempts with detailed info"""
+              attack_data = {
+                  'timestamp': datetime.now().isoformat(),
+                  'endpoint': endpoint,
+                  'ip': ip,
+                  'user_agent': user_agent,
+                  'headers': dict(headers),
+                  'response_type': response_type,
+                  'honeypot': 'FlashBang'
+              }
+              
+              # Log to file
+              with open('/opt/flashbang/logs/attacks.log', 'a') as f:
+                  f.write(f"{json.dumps(attack_data)}\n")
+              
+              # Log to CloudWatch via print
+              print(f"🎯 FlashBang attack: {json.dumps(attack_data)}")
+              
+              return attack_data
+          
+          def get_confusing_response():
+              """Return a random confusing response"""
+              return random.choice(CONFUSING_RESPONSES)
+          
+          def get_fake_error():
+              """Return a fake error message"""
+              return random.choice(FAKE_ERRORS)
+          
+          def get_fake_success():
+              """Return a fake success message"""
+              return random.choice(FAKE_SUCCESS)
+          
+          @app.route('/')
+          def home():
+              log_attack('/', request.remote_addr, request.user_agent.string, request.headers)
+              return render_template_string("""
+              <!DOCTYPE html>
+              <html>
+              <head>
+                  <title>Corporate Web Server</title>
+                  <style>
+                      body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+                      .container { background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                      .logo { color: #2c3e50; font-size: 28px; margin-bottom: 20px; }
+                      .nav { list-style: none; padding: 0; }
+                      .nav li { margin: 10px 0; }
+                      .nav a { color: #3498db; text-decoration: none; }
+                      .nav a:hover { text-decoration: underline; }
+                      .warning { color: #e74c3c; font-size: 12px; margin-top: 20px; }
+                  </style>
+              </head>
+              <body>
+                  <div class="container">
+                      <div class="logo">🏢 CyberCorp Industries</div>
+                      <p>Welcome to our internal web portal. This system contains sensitive corporate data.</p>
+                      <ul class="nav">
+                          <li>📁 <a href="/admin">Administrative Panel</a></li>
+                          <li>📄 <a href="/.env">Environment Configuration</a></li>
+                          <li>🔍 <a href="/api/users">User Directory</a></li>
+                          <li>💾 <a href="/backup">Database Backup</a></li>
+                          <li>🖥️ <a href="/shell">Remote Shell Access</a></li>
+                          <li>📊 <a href="/phpmyadmin">Database Manager</a></li>
+                          <li>🔧 <a href="/wp-admin">Content Manager</a></li>
+                      </ul>
+                      <div class="warning">⚠️ Unauthorized access is strictly prohibited and monitored.</div>
+                  </div>
+              </body>
+              </html>
+              """)
+          
+          @app.route('/admin')
+          @app.route('/wp-admin')
+          @app.route('/phpmyadmin')
+          def admin_panel():
+              log_attack(request.path, request.remote_addr, request.user_agent.string, request.headers, "admin_attempt")
+              time.sleep(random.uniform(1, 3))  # Simulate processing
+              return f"""
+              <html>
+              <head><title>Authentication Required</title></head>
+              <body style="font-family: Arial; padding: 40px; background: #2c3e50; color: white;">
+                  <h2>🔐 Secure Login Portal</h2>
+                  <p style="color: #e74c3c;">{get_confusing_response()}</p>
+                  <form>
+                      <input type="text" placeholder="Username" style="margin: 10px; padding: 8px;"><br>
+                      <input type="password" placeholder="Password" style="margin: 10px; padding: 8px;"><br>
+                      <button type="button" onclick="alert('{get_fake_success()}')" style="margin: 10px; padding: 8px 16px;">Login</button>
+                  </form>
+                  <div style="margin-top: 20px; font-size: 12px; color: #95a5a6;">
+                      Connection from: {request.remote_addr}<br>
+                      Session ID: {random.randint(100000, 999999)}<br>
+                      Security Level: MAXIMUM
+                  </div>
+              </body>
+              </html>
+              """
+          
+          @app.route('/.env')
+          @app.route('/config.php')
+          @app.route('/wp-config.php')
+          def env_file():
+              log_attack(request.path, request.remote_addr, request.user_agent.string, request.headers, "config_file")
+              return f"""# Configuration File - {get_confusing_response()}
+          
+          DB_HOST=internal-db-cluster.company.local
+          DB_USERNAME=admin_{random.randint(1000, 9999)}
+          DB_PASSWORD={random.choice(['P@ssw0rd123', 'SecureDB2023!', 'admin123', 'database_key_2023'])}
+          API_KEY=sk-{random.randint(100000000000, 999999999999)}
+          SECRET_TOKEN={random.randint(10**20, 10**21)}
+          AWS_ACCESS_KEY=AKIAI{random.randint(10**10, 10**11)}
+          AWS_SECRET_KEY={random.randint(10**30, 10**31)}
+          
+          # WARNING: {get_fake_error()}
+          # System compromised at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+          """
+          
+          @app.route('/shell')
+          @app.route('/cmd')
+          @app.route('/execute')
+          def shell_access():
+              log_attack(request.path, request.remote_addr, request.user_agent.string, request.headers, "shell_attempt")
+              # Redirect to rickroll after logging the attempt
+              return redirect('https://www.youtube.com/watch?v=dQw4w9WgXcQ')
+          
+          @app.route('/api/users')
+          @app.route('/users.json')
+          def api_users():
+              log_attack(request.path, request.remote_addr, request.user_agent.string, request.headers, "data_access")
+              fake_users = [
+                  {"id": i, "username": f"user{i}", "email": f"user{i}@company.com", "role": random.choice(["admin", "user", "manager"])}
+                  for i in range(1, random.randint(50, 200))
+              ]
+              return jsonify({
+                  "status": get_fake_success(),
+                  "users": fake_users,
+                  "total": len(fake_users),
+                  "warning": get_confusing_response()
+              })
+          
+          @app.route('/backup')
+          @app.route('/dump.sql')
+          @app.route('/database.sql')
+          def backup_file():
+              log_attack(request.path, request.remote_addr, request.user_agent.string, request.headers, "backup_access")
+              return f"""-- Database Backup Generated: {datetime.now()}
+          -- {get_confusing_response()}
+          
+          CREATE DATABASE corporate_data;
+          USE corporate_data;
+          
+          CREATE TABLE users (
+              id INT PRIMARY KEY,
+              username VARCHAR(50),
+              password_hash VARCHAR(255),
+              email VARCHAR(100),
+              ssn VARCHAR(11),
+              credit_card VARCHAR(16)
+          );
+          
+          INSERT INTO users VALUES 
+          (1, 'admin', 'hash_{random.randint(10**10, 10**11)}', 'admin@company.com', 'XXX-XX-XXXX', 'XXXX-XXXX-XXXX-XXXX'),
+          (2, 'ceo', 'hash_{random.randint(10**10, 10**11)}', 'ceo@company.com', 'XXX-XX-XXXX', 'XXXX-XXXX-XXXX-XXXX');
+          
+          -- ERROR: {get_fake_error()}
+          -- {get_confusing_response()}
+          """
+          
+          @app.route('/health-check')
+          def health_check():
+              return "OK", 200
+          
+          # Catch-all route for other attack attempts
+          @app.route('/<path:path>')
+          def catch_all(path):
+              log_attack(f"/{path}", request.remote_addr, request.user_agent.string, request.headers, "unknown_path")
+              if any(keyword in path.lower() for keyword in ['admin', 'login', 'auth', 'secure']):
+                  return f"<h1>Access Denied</h1><p>{get_confusing_response()}</p>"
+              elif any(keyword in path.lower() for keyword in ['file', 'upload', 'download']):
+                  return f"<h1>File Not Found</h1><p>{get_fake_error()}</p>"
+              else:
+                  return f"<h1>🎯 FlashBang Activated</h1><p>{get_confusing_response()}</p><p>Your request has been logged and analyzed.</p>"
+          
+          if __name__ == '__main__':
+              os.makedirs('/opt/flashbang/logs', exist_ok=True)
+              app.run(host='0.0.0.0', port=80, debug=False)
+          EOF
+          
+          # Create interactive services honeypot
+          cat > /opt/flashbang/interactive_services.py << 'EOF'
+          import asyncio
+          import logging
+          import json
+          import random
+          from datetime import datetime
+          
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger(__name__)
+          
+          FAKE_BANNERS = {
+              'ssh': [
+                  b'SSH-2.0-OpenSSH_8.0\r\n',
+                  b'SSH-2.0-OpenSSH_7.4\r\n',
+                  b'SSH-2.0-Cisco-1.25\r\n'
+              ],
+              'ftp': [
+                  b'220 Welcome to CyberCorp FTP Server\r\n',
+                  b'220 Microsoft FTP Service\r\n',
+                  b'220 ProFTPD Server ready\r\n'
+              ],
+              'telnet': [
+                  b'Welcome to CyberCorp Terminal Server\r\nLogin: ',
+                  b'Red Hat Enterprise Linux Server\r\nlogin: ',
+                  b'Ubuntu 20.04.3 LTS\r\nlogin: '
+              ]
+          }
+          
+          CONFUSING_RESPONSES = [
+              b'Access granted... establishing secure connection...\r\n',
+              b'Decrypting credentials... please wait...\r\n',
+              b'WARNING: Intrusion attempt logged. Authorities notified.\r\n',
+              b'System honeypot activated. Recording session.\r\n',
+              b'Connection traced to your location.\r\n'
+          ]
+          
+          class FlashBangHoneypot:
+              def __init__(self, port, service_name):
+                  self.port = port
+                  self.service_name = service_name
+          
+              async def handle_connection(self, reader, writer):
+                  addr = writer.get_extra_info('peername')
+                  logger.info(f"🎯 FlashBang {self.service_name} connection from {addr}")
+          
+                  # Log the connection
+                  with open(f'/opt/flashbang/logs/{self.service_name}.log', 'a') as f:
+                      f.write(f"{datetime.now().isoformat()} - Connection from {addr}\n")
+          
+                  try:
+                      # Send random banner
+                      banner = random.choice(FAKE_BANNERS[self.service_name])
+                      writer.write(banner)
+                      await writer.drain()
+          
+                      # Wait for input and respond confusingly
+                      for _ in range(random.randint(2, 5)):
+                          try:
+                              data = await asyncio.wait_for(reader.read(100), timeout=30.0)
+                              if not data:
+                                  break
+                              
+                              # Log the input
+                              with open(f'/opt/flashbang/logs/{self.service_name}.log', 'a') as f:
+                                  f.write(f"{datetime.now().isoformat()} - Input: {data.decode('utf-8', errors='ignore').strip()}\n")
+                              
+                              # Send confusing response
+                              response = random.choice(CONFUSING_RESPONSES)
+                              writer.write(response)
+                              await writer.drain()
+                              
+                              # Add random delay
+                              await asyncio.sleep(random.uniform(0.5, 2.0))
+                              
+                          except asyncio.TimeoutError:
+                              break
+                          except Exception as e:
+                              logger.error(f"Error handling {self.service_name} data: {e}")
+                              break
+                      
+                      # Final confusing message
+                      writer.write(b'Session terminated. Have a nice day.\r\n')
+                      await writer.drain()
+                      
+                  except Exception as e:
+                      logger.error(f"Error in {self.service_name} handler: {e}")
+                  finally:
+                      writer.close()
+                      await writer.wait_closed()
+          
+              async def start(self):
+                  server = await asyncio.start_server(
+                      self.handle_connection, '0.0.0.0', self.port
+                  )
+                  logger.info(f"🎯 FlashBang {self.service_name} honeypot running on port {self.port}")
+                  async with server:
+                      await server.serve_forever()
+          
+          async def main():
+              # Start multiple honeypot services
+              ssh_honeypot = FlashBangHoneypot(2222, 'ssh')
+              ftp_honeypot = FlashBangHoneypot(21, 'ftp')
+              telnet_honeypot = FlashBangHoneypot(23, 'telnet')
+          
+              # Run all services concurrently
+              await asyncio.gather(
+                  ssh_honeypot.start(),
+                  ftp_honeypot.start(),
+                  telnet_honeypot.start()
+              )
+          
+          if __name__ == '__main__':
+              asyncio.run(main())
+          EOF
+          
+          # Create systemd services
+          cat > /etc/systemd/system/flashbang-web.service << 'EOF'
+          [Unit]
+          Description=FlashBang Web Honeypot
+          After=network.target
+          
+          [Service]
+          Type=simple
+          User=root
+          Group=root
+          WorkingDirectory=/opt/flashbang
+          ExecStart=/usr/bin/python3 /opt/flashbang/app.py
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+          
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          
+          cat > /etc/systemd/system/flashbang-interactive.service << 'EOF'
+          [Unit]
+          Description=FlashBang Interactive Services Honeypot
+          After=network.target
+          
+          [Service]
+          Type=simple
+          User=ec2-user
+          Group=ec2-user
+          WorkingDirectory=/opt/flashbang
+          ExecStart=/usr/bin/python3 /opt/flashbang/interactive_services.py
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+          
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          
+          # Create monitoring script
+          cat > /opt/flashbang/scripts/health_check.sh << 'EOF'
+          #!/bin/bash
+          echo "🎯 FlashBang Health Check - $(date)"
+          echo "================================"
+          
+          # Check services
+          for service in flashbang-web flashbang-interactive; do
+              if systemctl is-active --quiet $service; then
+                  echo "✅ $service: Running"
+              else
+                  echo "❌ $service: NOT Running"
+                  echo "  → Restarting $service..."
+                  systemctl restart $service
+              fi
+          done
+          
+          # Check ports
+          echo ""
+          echo "Port Status:"
+          for port in 80 2222 21 23; do
+              if netstat -tlnp | grep -q ":$port "; then
+                  echo "✅ Port $port: Open"
+              else
+                  echo "❌ Port $port: Closed"
+              fi
+          done
+          
+          # Check recent activity
+          echo ""
+          echo "Recent Activity:"
+          if [ -f /opt/flashbang/logs/attacks.log ]; then
+              RECENT_ATTACKS=$(tail -n 100 /opt/flashbang/logs/attacks.log | wc -l)
+              echo "📊 Recent attack logs: $RECENT_ATTACKS entries"
+          else
+              echo "ℹ️ No attack logs found yet"
+          fi
+          EOF
+          
+          chmod +x /opt/flashbang/scripts/health_check.sh
+          
+          # Set permissions
+          chown -R ec2-user:ec2-user /opt/flashbang
+          
+          # Enable and start services
+          systemctl daemon-reload
+          systemctl enable flashbang-web flashbang-interactive
+          systemctl start flashbang-web
+          sleep 5
+          systemctl start flashbang-interactive
+          
+          # Setup log rotation
+          cat > /etc/logrotate.d/flashbang << 'EOF'
+          /opt/flashbang/logs/*.log {
+              daily
+              missingok
+              rotate 30
+              compress
+              delaycompress
+              notifempty
+              create 644 ec2-user ec2-user
+          }
+          EOF
+          
+          # Add cron job for health checks
+          (crontab -l 2>/dev/null; echo "*/5 * * * * /opt/flashbang/scripts/health_check.sh >> /opt/flashbang/logs/health.log 2>&1") | crontab -
+          
+          # Final health check
+          sleep 10
+          /opt/flashbang/scripts/health_check.sh
+          
+          echo "🎯 FlashBang Honeypot deployment completed successfully at $(date)"
+          echo "🌐 Access your honeypot at: http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)"
+          echo "📊 Monitor logs: tail -f /opt/flashbang/logs/attacks.log
